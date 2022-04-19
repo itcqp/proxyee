@@ -19,19 +19,25 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http.*;
+import io.netty.handler.codec.http.websocketx.*;
 import io.netty.handler.proxy.ProxyHandler;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.resolver.NoopAddressResolverGroup;
+import io.netty.util.AttributeKey;
 import io.netty.util.ReferenceCountUtil;
 
 import java.net.InetSocketAddress;
 import java.net.URL;
+import java.util.Collection;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 public class HttpProxyServerHandler extends ChannelInboundHandlerAdapter {
-
+    // 存放已经连接的通道
+    private  static ConcurrentMap<String, Channel> ChannelMap=new ConcurrentHashMap();
     private ChannelFuture cf;
     private RequestProto requestProto;
     private int status = 0;
@@ -117,8 +123,20 @@ public class HttpProxyServerHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void channelRead(final ChannelHandlerContext ctx, final Object msg) throws Exception {
-        if (msg instanceof HttpRequest) {
+
+        if (msg instanceof FullHttpRequest) {
             HttpRequest request = (HttpRequest) msg;
+            if (isWebSocketUpgrade(request)) {
+                String token = request.headers().get("host");
+                //参数传递
+                if (!AttributeKey.exists("token")) {
+                    ctx.channel().attr(AttributeKey.newInstance("token")).set(token);
+                } else {
+                    ctx.channel().attr(AttributeKey.valueOf("token")).set(token);
+                }
+                super.channelRead(ctx, msg);
+                return;
+            }
             // 第一次建立连接取host和端口号和处理代理握手
             if (getStatus() == 0) {
                 setRequestProto(ProtoUtil.getRequestProto(request));
@@ -150,6 +168,8 @@ public class HttpProxyServerHandler extends ChannelInboundHandlerAdapter {
                     return;
                 }
             }
+            //websocket处理
+//            handleHttpRequest(ctx,(HttpRequest)msg);
             setInterceptPipeline(buildPipeline());
             getInterceptPipeline().setRequestProto(getRequestProto().copy());
             // fix issue #27
@@ -165,7 +185,30 @@ public class HttpProxyServerHandler extends ChannelInboundHandlerAdapter {
                 ReferenceCountUtil.release(msg);
                 setStatus(1);
             }
-        } else { // ssl和websocket的握手处理
+        }else if (msg instanceof WebSocketFrame) {
+            System.out.println("进入websocket处理");
+            super.channelRead(ctx, msg);
+            return;
+//   判断是否关闭链路的指令
+//            if (frame instanceof CloseWebSocketFrame) {
+//                socketServerHandshaker.close(ctx.channel(), (CloseWebSocketFrame) frame.retain());
+//            }
+//            // 判断是否ping消息
+//            if (frame instanceof PingWebSocketFrame) {
+//                ctx.channel().write(new PongWebSocketFrame(frame.content().retain()));
+//                return;
+//            }
+//            // 本例程仅支持文本消息，不支持二进制消息
+//            if (!(frame instanceof TextWebSocketFrame)) {
+//                throw new UnsupportedOperationException(String.format("%s frame types not supported", frame.getClass().getName()));
+//            }
+//            // 返回应答消息
+//            String request = ((TextWebSocketFrame) frame).text();
+//            System.out.println("服务端收到：" + request);
+//            TextWebSocketFrame tws = new TextWebSocketFrame(new Date().toString() + ctx.channel().id() + "：" + request);
+//            // 群发
+//            group.writeAndFlush(tws);
+        }else { // ssl和websocket的握手处理
             ByteBuf byteBuf = (ByteBuf) msg;
             if (getServerConfig().isHandleSsl() && byteBuf.getByte(0) == 22) {// ssl握手
                 getRequestProto().setSsl(true);
@@ -325,6 +368,9 @@ public class HttpProxyServerHandler extends ChannelInboundHandlerAdapter {
             public void beforeRequest(Channel clientChannel, HttpRequest httpRequest, HttpProxyInterceptPipeline pipeline)
                     throws Exception {
                 handleProxyData(clientChannel, httpRequest, true);
+                if (HttpHeaderValues.WEBSOCKET.toString().equals(httpRequest.headers().get(HttpHeaderNames.UPGRADE))) {
+                    System.out.println("请求websocket:" + httpRequest.toString());
+                }
             }
 
             @Override
@@ -339,6 +385,7 @@ public class HttpProxyServerHandler extends ChannelInboundHandlerAdapter {
                 clientChannel.writeAndFlush(httpResponse);
                 if (HttpHeaderValues.WEBSOCKET.toString().equals(httpResponse.headers().get(HttpHeaderNames.UPGRADE))) {
                     // websocket转发原始报文
+                    System.out.println("11websocket:" + httpResponse.toString());
                     proxyChannel.pipeline().remove("httpCodec");
                     clientChannel.pipeline().remove("httpCodec");
                 }
@@ -360,4 +407,35 @@ public class HttpProxyServerHandler extends ChannelInboundHandlerAdapter {
         getInterceptInitializer().init(interceptPipeline);
         return interceptPipeline;
     }
+
+    /**
+     * @author lsc
+     * <p> 处理http请求升级</p>
+     */
+    private void handleHttpRequest(ChannelHandlerContext ctx,
+                                   HttpRequest req) throws Exception {
+
+        // 该请求是不是websocket upgrade请求
+        if (isWebSocketUpgrade(req)) {
+            String ws = "ws://127.0.0.1:9999";
+            WebSocketServerHandshakerFactory factory = new WebSocketServerHandshakerFactory(ws, null, false);
+            WebSocketServerHandshaker handshaker = factory.newHandshaker(req);
+
+            if (handshaker == null) {// 请求头不合法, 导致handshaker没创建成功
+                WebSocketServerHandshakerFactory.sendUnsupportedVersionResponse(ctx.channel());
+            } else {
+                // 响应该请求
+                handshaker.handshake(ctx.channel(), req);
+            }
+            return;
+        }
+    }
+
+    //n1.GET? 2.Upgrade头 包含websocket字符串?
+    private boolean isWebSocketUpgrade(HttpRequest req) {
+        HttpHeaders headers = req.headers();
+        return req.method().equals(HttpMethod.GET)
+                && headers.get(HttpHeaderNames.UPGRADE).equals("websocket");
+    }
+
 }

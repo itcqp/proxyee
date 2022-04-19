@@ -3,22 +3,25 @@ package com.github.monkeywie.proxyee.server;
 import com.github.monkeywie.proxyee.crt.CertPool;
 import com.github.monkeywie.proxyee.crt.CertUtil;
 import com.github.monkeywie.proxyee.exception.HttpProxyExceptionHandle;
+import com.github.monkeywie.proxyee.handler.BinaryWebSocketFrameHandler;
 import com.github.monkeywie.proxyee.handler.HttpProxyServerHandler;
+import com.github.monkeywie.proxyee.handler.TextWebSocketFrameHandler;
+import com.github.monkeywie.proxyee.handler.WebSocketServerHandler;
 import com.github.monkeywie.proxyee.intercept.HttpProxyInterceptInitializer;
 import com.github.monkeywie.proxyee.proxy.ProxyConfig;
 import io.netty.bootstrap.ServerBootstrap;
-import io.netty.channel.Channel;
-import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelInitializer;
-import io.netty.channel.EventLoopGroup;
+import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpServerCodec;
+import io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandler;
 import io.netty.handler.logging.LogLevel;
 import io.netty.handler.logging.LoggingHandler;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
+import io.netty.handler.stream.ChunkedWriteHandler;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
@@ -138,8 +141,9 @@ public class HttpProxyServer {
                 latch.countDown();
             });
             latch.await();
-            channelFuture.channel().closeFuture().sync();
+            channelFuture.sync().channel().closeFuture().sync();
         } catch (Exception e) {
+            log.error("异常：" + e.getMessage(), e);
             httpProxyExceptionHandle.startCatch(e);
         } finally {
             close();
@@ -173,16 +177,22 @@ public class HttpProxyServer {
         ServerBootstrap bootstrap = new ServerBootstrap();
         bootstrap.group(bossGroup, workerGroup)
                 .channel(NioServerSocketChannel.class)
-//                .option(ChannelOption.SO_BACKLOG, 100)
+                .option(ChannelOption.SO_BACKLOG, 100)
+                .childOption(ChannelOption.TCP_NODELAY, true)
+                .childOption(ChannelOption.SO_KEEPALIVE, true)
                 .handler(new LoggingHandler(LogLevel.DEBUG))
                 .childHandler(new ChannelInitializer<Channel>() {
 
                     @Override
                     protected void initChannel(Channel ch) throws Exception {
                         ch.pipeline().addLast("httpCodec", new HttpServerCodec());
-                        ch.pipeline().addLast("serverHandle",
-                                new HttpProxyServerHandler(serverConfig, proxyInterceptInitializer, proxyConfig,
-                                        httpProxyExceptionHandle));
+                        ch.pipeline().addLast("aggregator",new HttpObjectAggregator(65536));
+                        ch.pipeline().addLast("cw",new ChunkedWriteHandler());
+//                        ch.pipeline().addLast("ws", new WebSocketServerHandler());
+                        ch.pipeline().addLast("serverHandle",new HttpProxyServerHandler(serverConfig, proxyInterceptInitializer, proxyConfig, httpProxyExceptionHandle));
+                        ch.pipeline().addLast("WebSocket-protocol",new WebSocketServerProtocolHandler("/"));
+                        ch.pipeline().addLast("WebSocket-request",new BinaryWebSocketFrameHandler());
+                        ch.pipeline().addLast("WebSocket-trequest",new TextWebSocketFrameHandler());
                     }
                 });
 
