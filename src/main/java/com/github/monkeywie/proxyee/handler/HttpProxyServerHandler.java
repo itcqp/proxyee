@@ -137,6 +137,14 @@ public class HttpProxyServerHandler extends ChannelInboundHandlerAdapter {
                 super.channelRead(ctx, msg);
                 return;
             }
+//            if (msg instanceof HttpContent) {
+//                if (getStatus() != 2) {
+//                    getInterceptPipeline().beforeRequest(ctx.channel(), (HttpContent) msg);
+//                } else {
+//                    ReferenceCountUtil.release(msg);
+//                    setStatus(1);
+//                }
+//            }
             // 第一次建立连接取host和端口号和处理代理握手
             if (getStatus() == 0) {
                 setRequestProto(ProtoUtil.getRequestProto(request));
@@ -163,6 +171,7 @@ public class HttpProxyServerHandler extends ChannelInboundHandlerAdapter {
                     HttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpProxyServer.SUCCESS);
                     ctx.writeAndFlush(response);
                     ctx.channel().pipeline().remove("httpCodec");
+                    ctx.channel().pipeline().remove("aggregator");
                     // fix issue #42
                     ReferenceCountUtil.release(msg);
                     return;
@@ -186,6 +195,22 @@ public class HttpProxyServerHandler extends ChannelInboundHandlerAdapter {
                 setStatus(1);
             }
         }else if (msg instanceof WebSocketFrame) {
+            if (msg instanceof CloseWebSocketFrame) {
+                System.out.println("进入websocket进行关闭");
+                MyWebsocketClient ws = ProxyClient.channelBooleanMap.get(ctx);
+                if (ws != null) {
+                    ws.close();
+                    ProxyClient.channelBooleanMap.remove(ctx);
+                }
+                ReferenceCountUtil.release(msg);
+                return;
+            } else if (msg instanceof PingWebSocketFrame) { {
+                MyWebsocketClient ws = ProxyClient.channelBooleanMap.get(ctx);
+                if (ws != null) {
+                    ws.sendPing();
+                }
+            }
+            }
             System.out.println("进入websocket处理");
             super.channelRead(ctx, msg);
             return;
