@@ -124,7 +124,7 @@ public class HttpProxyServerHandler extends ChannelInboundHandlerAdapter {
     @Override
     public void channelRead(final ChannelHandlerContext ctx, final Object msg) throws Exception {
 
-        if (msg instanceof FullHttpRequest) {
+        if (msg instanceof FullHttpRequest || msg instanceof HttpRequest) {
             HttpRequest request = (HttpRequest) msg;
             if (isWebSocketUpgrade(request)) {
                 String token = request.headers().get("host");
@@ -171,7 +171,11 @@ public class HttpProxyServerHandler extends ChannelInboundHandlerAdapter {
                     HttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpProxyServer.SUCCESS);
                     ctx.writeAndFlush(response);
                     ctx.channel().pipeline().remove("httpCodec");
-                    ctx.channel().pipeline().remove("aggregator");
+//                    ctx.channel().pipeline().remove("aggregator");
+//                    ctx.channel().pipeline().remove("cw");
+//                    ctx.channel().pipeline().remove("WebSocket-protocol");
+//                    ctx.channel().pipeline().remove("WebSocket-request");
+//                    ctx.channel().pipeline().remove("WebSocket-trequest");
                     // fix issue #42
                     ReferenceCountUtil.release(msg);
                     return;
@@ -284,6 +288,8 @@ public class HttpProxyServerHandler extends ChannelInboundHandlerAdapter {
         if (getChannelFuture() != null) {
             getChannelFuture().channel().close();
         }
+        System.out.println("异常"+cause.getMessage());
+        cause.printStackTrace();
         ctx.channel().close();
         exceptionHandle.beforeCatch(ctx.channel(), cause);
     }
@@ -460,7 +466,7 @@ public class HttpProxyServerHandler extends ChannelInboundHandlerAdapter {
     private boolean isWebSocketUpgrade(HttpRequest req) {
         HttpHeaders headers = req.headers();
         return req.method().equals(HttpMethod.GET)
-                && headers.get(HttpHeaderNames.UPGRADE).equals("websocket");
+                && "websocket".equals(headers.get(HttpHeaderNames.UPGRADE));
     }
 
 }
