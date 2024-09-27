@@ -52,22 +52,22 @@ public class WebSocketClient {
             System.setProperty("https.proxyPort", "9999");
 
             // 连接到 WebSocket 服务器
-//            Session session = client.connectToServer(WebSocketClient.class, URI.create("wss://im-linkserver-62.csdn.net/"));
-            Session session = client.connectToServer(WebSocketClient.class, URI.create("ws://10.10.20.100/gateway/notify-service/socket?clientId=pc&Authorization=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJjYWNoZUtleSI6IkNPTlNPTEU6VVNFUl9UT0tFTjpjaGVucXA6MjkxNDc1NDE4NzkxMTI2MjIwOCIsImNsaWVudENvZGUiOiI4MDAiLCJpc3MiOiJNSU5HIiwiaXNBcHAiOiJmYWxzZSIsInVzZXJDb2RlIjoiY2hlbnFwIn0.53Ve46GKvEMOLvzl4lPtRb4HN-gz2vXyGibuMhSnREw"));
+            Session session = client.connectToServer(WebSocketClient.class, URI.create("wss://im-linkserver-62.csdn.net/"));
+//            Session session = client.connectToServer(WebSocketClient.class, URI.create("ws://10.10.20.100/gateway/notify-service/socket?clientId=pc&Authorization=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJjYWNoZUtleSI6IkNPTlNPTEU6VVNFUl9UT0tFTjpjaGVucXA6MjkxNDc1NDE4NzkxMTI2MjIwOCIsImNsaWVudENvZGUiOiI4MDAiLCJpc3MiOiJNSU5HIiwiaXNBcHAiOiJmYWxzZSIsInVzZXJDb2RlIjoiY2hlbnFwIn0.53Ve46GKvEMOLvzl4lPtRb4HN-gz2vXyGibuMhSnREw"));
 
 //            // 发送消息示例
-            session.getBasicRemote().sendText("666");
-//            session.getBasicRemote().sendText("{\n" +
-//                    "    \"ver\": \"1.0\",\n" +
-//                    "    \"cmdId\": 2,\n" +
-//                    "    \"isZip\": 0,\n" +
-//                    "    \"body\": {\n" +
-//                    "        \"userId\": \"qq_35215932\",\n" +
-//                    "        \"appId\": \"CSDN-PC\",\n" +
-//                    "        \"imToken\": \"172714398821870MNuFhe\",\n" +
-//                    "        \"groupId\": \"CSDN-private-MSG\"\n" +
-//                    "    }\n" +
-//                    "}");
+//            session.getBasicRemote().sendText("666");
+            session.getBasicRemote().sendText("{\n" +
+                    "    \"ver\": \"1.0\",\n" +
+                    "    \"cmdId\": 2,\n" +
+                    "    \"isZip\": 0,\n" +
+                    "    \"body\": {\n" +
+                    "        \"userId\": \"qq_35215932\",\n" +
+                    "        \"appId\": \"CSDN-PC\",\n" +
+                    "        \"imToken\": \"172714398821870MNuFhe\",\n" +
+                    "        \"groupId\": \"CSDN-private-MSG\"\n" +
+                    "    }\n" +
+                    "}");
             while (true) {
                 // 等待用户输入消息
                 ThreadUtil.sleep(2000);
