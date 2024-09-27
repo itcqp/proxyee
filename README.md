@@ -8,7 +8,7 @@
   </p>
   <p>
 
-  [English](/README.md) | [中文](/README_zh-CN.md)
+[English](/README.md) | [中文](/README_zh-CN.md)
 
   </p>
 </div>
@@ -25,7 +25,7 @@ Proxyee is a JAVA written HTTP proxy server library that supports HTTP, HTTPS, W
 <dependency>
     <groupId>com.github.monkeywie</groupId>
     <artifactId>proxyee</artifactId>
-    <version>1.6.3</version>
+    <version>1.7.6</version>
 </dependency>
 ```
 
@@ -89,20 +89,20 @@ The CA certificate (src/resources/ca.crt) from the project needs to be imported 
 You can use the CertDownIntercept interceptor to enable the web certificate download feature, visit http://serverIP:serverPort to access.
 
 > Note 1: If the certificate installation on Android phones pops up the password stored in your credentials, just enter the lock screen password.
-> 
+>
 > Note 2: Android 7 and above, the system no longer trusts user-installed certificates, you need to root and use the
 > cat ca.crt > $(openssl x509 -inform PEM -subject_hash_old -in ca.crt | head -1).0
 > command generates the d1488b25.0 file, and then moves the file to the
 > /system/etc/security/cacerts/
 > And give 644 access.
-> 
+>
 > Note 3: In Android 7 and above, even if you add the certificate to the system certificate, this certificate does not work in chrome. The reason is that chrome will only trust certificates with validity less than 27 months from 2018 (https://www.entrustdatacard.com/blog/2018/february/chrome-requires-ct-after-april-2018). So you need to generate the certificate file yourself.
 
 ### Custom CA
 
 Since the root certificate and private key attached to the project are public, they are only suitable for local development and debugging, please generate your own root certificate and private key when using in the official environment, otherwise there will be risks.
 
--  running the main method of the`com.github.monkeywie.proxyee.crt.CertUtil` class
+- running the main method of the`com.github.monkeywie.proxyee.crt.CertUtil` class
 
 - use openssl
 
@@ -114,6 +114,19 @@ openssl req -sha256 -new -x509 -days 365 -key ca.key -out ca.crt \
 ```
 
 Copy `ca.crt` and `ca_private.der` to the project src/resources/ after generation, or implement the HttpProxyCACertFactory interface to custom load the root certificate and private key.
+
+### Rules for MITM
+
+If you only want to perform MITM attacks on certain domains, you can use the `HttpProxyServerConfig.setMitmMatcher` method to set the matching rule, for example:
+
+```java
+HttpProxyServerConfig config = new HttpProxyServerConfig();
+config.setHandleSsl(true);
+// only MITM on www.baidu.com
+config.setMitmMatcher(new DomainHttpProxyMitmMatcher(Arrays.asList("www.baidu.com")));
+```
+
+Now the built-in `DomainHttpProxyMitmMatcher` is an exact match for the request domain. If you have other requirements, you can implement the `HttpProxyMitmMatcher` interface to customize the matching rules.
 
 ## Authentication
 
@@ -159,6 +172,10 @@ new HttpProxyServer()
     .proxyConfig(new ProxyConfig(ProxyType.SOCKS5, "127.0.0.1", 1085))
     .start(9999);
 ```
+
+## Donate
+
+If you like this project, please consider [donating](/.donate/index.md) to support the development of this project, thank you!
 
 ## Flow
 
