@@ -3,7 +3,7 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.github.itcqp</groupId>
+    <groupId>com.github.monkeywie</groupId>
     <artifactId>proxyee</artifactId>
     <version>1.7.6</version>
 
@@ -41,7 +41,35 @@
         <netty.version>4.1.94.Final</netty.version>
     </properties>
 
+    <repositories>
+        <repository>
+            <id>aliyun-central</id>
+            <name>Aliyun Maven Central</name>
+            <url>https://maven.aliyun.com/repository/central</url>
+        </repository>
+        <repository>
+            <id>aliyun-spring</id>
+            <name>Aliyun Spring</name>
+            <url>https://maven.aliyun.com/repository/spring</url>
+        </repository>
+    </repositories>
     <dependencies>
+
+        <dependency>
+            <groupId>org.java-websocket</groupId>
+            <artifactId>Java-WebSocket</artifactId>
+            <version>1.5.3</version>
+        </dependency>
+        <dependency>
+            <groupId>cn.hutool</groupId>
+            <artifactId>hutool-all</artifactId>
+            <version>5.1.4</version>
+        </dependency>
+        <!--        <dependency>-->
+        <!--            <groupId>com.github.puhaiyang</groupId>-->
+        <!--            <artifactId>easy-http-proxy</artifactId>-->
+        <!--            <version>0.0.1</version>-->
+        <!--        </dependency>-->
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-buffer</artifactId>
@@ -72,21 +100,27 @@
             <artifactId>bcpkix-jdk15on</artifactId>
             <version>1.60</version>
         </dependency>
+        <!-- Tyrus WebSocket Client -->
         <dependency>
-            <groupId>org.java-websocket</groupId>
-            <artifactId>Java-WebSocket</artifactId>
-            <version>1.5.3</version>
+            <groupId>org.glassfish.tyrus.bundles</groupId>
+            <artifactId>tyrus-standalone-client</artifactId>
+            <version>1.17</version> <!-- 确保使用最新版本 -->
         </dependency>
+
+        <!-- 其他可能需要的依赖 -->
         <dependency>
-            <groupId>org.projectlombok</groupId>
-            <artifactId>lombok</artifactId>
-            <version>1.18.24</version>
+            <groupId>javax.websocket</groupId>
+            <artifactId>javax.websocket-api</artifactId>
+            <version>1.1</version>
+            <scope>provided</scope>
         </dependency>
+
         <dependency>
-            <groupId>cn.hutool</groupId>
-            <artifactId>hutool-all</artifactId>
-            <version>5.1.4</version>
+            <groupId>org.glassfish.tyrus</groupId>
+            <artifactId>tyrus-core</artifactId>
+            <version>1.17</version>
         </dependency>
+
     </dependencies>
 
 

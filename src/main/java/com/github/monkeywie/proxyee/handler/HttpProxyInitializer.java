@@ -37,5 +37,6 @@ public class HttpProxyInitializer extends ChannelInitializer {
                 serverConfig.getMaxHeaderSize(),
                 serverConfig.getMaxChunkSize()));
         ch.pipeline().addLast("proxyClientHandle", new HttpProxyClientHandler(clientChannel));
+        ch.pipeline().addLast("outproxyClientHandle", new HttpProxyClientOutMsgHandler(clientChannel));
     }
 }
