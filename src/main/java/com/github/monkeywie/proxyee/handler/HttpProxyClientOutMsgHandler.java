@@ -31,7 +31,7 @@ public class HttpProxyClientOutMsgHandler extends ChannelOutboundHandlerAdapter 
 //            ByteBuf bytes = DevinUtil.encodeWebSocketFrame("{\"ver\":\"1.0\",\"cmdId\":2,\"isZip\":0,\"body\":{\"userId\":\"qq_35215932\",\"appId\":\"CSDN-PC\",\"imToken\":\"1727579853874JxO3oRri\",\"groupId\":\"CSDN-private-MSG\"}}\t");
 //            ReferenceCountUtil.release(msg);
 //            ctx.write(Unpooled.wrappedBuffer(bytes), promise);
-            return;
+//            return;
         }else if (msg instanceof HttpContent) {
             DevinUtil.printMsg((HttpContent) msg, "客户端请求body内容222");
         }
