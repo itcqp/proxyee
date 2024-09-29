@@ -9,7 +9,9 @@ import io.netty.util.CharsetUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.Random;
 
 /**
  * @version 1.0.0
@@ -28,10 +30,6 @@ public class DevinUtil {
      */
     public static void printMsg(ByteBuf byteBuf, String pre) {
         if (!byteBuf.isReadable()) {
-            // 消息为空
-//            String msg = "消息为空，不打印消息";
-//            log.info(msg);
-//            System.out.println(msg);
             return;
         }
         ByteBuf copy = byteBuf.copy();
@@ -89,4 +87,140 @@ public class DevinUtil {
         response.headers().set(HttpHeaderNames.CONTENT_LENGTH, customContentBuf.readableBytes());
         return response;
     }
+
+    /**
+     * 解码websocket 完整帧消息，返回明文内容
+     * @param byteBuf
+     * @return
+     */
+    public static String decodeWebSocketPayload(ByteBuf byteBuf) {
+        if (!byteBuf.isReadable()) {
+            return "";
+        }
+        ByteBuf copy = byteBuf.copy();
+        byte[] data = hexStringToByteArray(ByteBufUtil.hexDump(copy));
+        ByteBuffer buffer = ByteBuffer.wrap(data);
+        // 解析第1个字节 (FIN, RSV1-3, OPCODE)
+        byte b1 = buffer.get();
+        boolean fin = (b1 & 0x80) != 0; // FIN 位
+        byte opcode = (byte) (b1 & 0x0F); // OPCODE
+
+        // 解析第2个字节 (MASK, Payload length)
+        byte b2 = buffer.get();
+        boolean masked = (b2 & 0x80) != 0; // Mask 位
+        int payloadLength = b2 & 0x7F; // Payload 长度
+
+        // 如果负载长度为126或127，需要额外读取字节
+        if (payloadLength == 126) {
+            payloadLength = buffer.getShort();
+        } else if (payloadLength == 127) {
+            payloadLength = (int) buffer.getLong();
+        }
+
+        // 获取 Masking Key
+        byte[] mask = null;
+        if (masked) {
+            mask = new byte[4];
+            buffer.get(mask);
+        }
+
+        // 读取负载数据
+        byte[] payloadData = new byte[payloadLength];
+        buffer.get(payloadData);
+
+        // 如果有 Masking Key，进行解码
+        if (masked) {
+            for (int i = 0; i < payloadData.length; i++) {
+                payloadData[i] ^= mask[i % 4]; // 使用 Mask Key 进行解码
+            }
+        }
+
+        // 将解码后的负载数据转换为字符串
+        return new String(payloadData);
+    }
+
+    /**
+     * 编码websocket 完整帧消息
+     * @param message 明文内容
+     * @return
+     */
+    public static ByteBuf encodeWebSocketFrame(String message) {
+        byte[] messageBytes = message.getBytes(); // 将消息转换为字节数组
+        int messageLength = messageBytes.length;
+
+        // 构建帧头
+        ByteBuffer buffer = ByteBuffer.allocate(2 + (messageLength > 125 ? 2 : 0) + 4 + messageLength);
+        byte b1 = (byte) 0x81; // FIN=1, OPCODE=0x1 (文本帧)
+        buffer.put(b1);
+
+        // 构建帧头第二个字节：Mask=1, Payload Length
+        if (messageLength <= 125) {
+            buffer.put((byte) (0x80 | messageLength)); // Mask=1, 小于等于125字节
+        } else if (messageLength <= 0xFFFF) {
+            buffer.put((byte) 0xFE); // Mask=1, 负载长度使用16位
+            buffer.putShort((short) messageLength); // 16位的负载长度
+        } else {
+            throw new IllegalArgumentException("Message is too long");
+        }
+
+        // 生成随机 Masking Key
+        byte[] mask = new byte[4];
+        new Random().nextBytes(mask);
+        buffer.put(mask); // 添加 Masking Key
+
+        // 对负载数据进行掩码处理（异或操作）
+        for (int i = 0; i < messageBytes.length; i++) {
+            messageBytes[i] ^= mask[i % 4]; // 使用 Mask Key 对每个字节进行异或
+        }
+
+        // 添加被掩码处理后的负载数据
+        buffer.put(messageBytes);
+
+        // 返回完整的 WebSocket 帧
+        return Unpooled.wrappedBuffer(buffer.array());
+    }
+
+    // 将十六进制字符串转换为字节数组
+    public static byte[] hexStringToByteArray(String hex) {
+        int len = hex.length();
+        byte[] data = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            data[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4) + Character.digit(hex.charAt(i + 1), 16));
+        }
+        return data;
+    }
+    public boolean isWebSocketFrame(ByteBuf byteBuf) {
+        // 标记当前读取位置，便于重置
+        byteBuf.markReaderIndex();
+
+        // 确保有足够的数据可读（WebSocket 帧至少有两个字节）
+        if (byteBuf.readableBytes() < 2) {
+            byteBuf.resetReaderIndex();
+            return false;
+        }
+
+        // 读取第一个字节
+        byte firstByte = byteBuf.readByte();
+
+        // 重置读取位置
+        byteBuf.resetReaderIndex();
+
+        // 获取 FIN 位（最高位）
+        boolean fin = (firstByte & 0x80) != 0;
+
+        // 获取 Opcode (低4位)
+        byte opcode = (byte) (firstByte & 0x0F);
+
+        // WebSocket 帧的 Opcode 应该是以下之一
+        if (opcode == 0x1 || // 文本帧
+                opcode == 0x2 || // 二进制帧
+                opcode == 0x8 || // 关闭帧
+                opcode == 0x9 || // Ping 帧
+                opcode == 0xA) { // Pong 帧
+            return true;
+        }
+
+        return false;
+    }
+
 }
