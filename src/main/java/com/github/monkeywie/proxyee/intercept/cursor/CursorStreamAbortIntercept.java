@@ -1,5 +1,6 @@
 package com.github.monkeywie.proxyee.intercept.cursor;
 
+import cn.hutool.core.util.StrUtil;
 import com.github.monkeywie.proxyee.intercept.HttpProxyIntercept;
 import com.github.monkeywie.proxyee.intercept.HttpProxyInterceptPipeline;
 import io.netty.buffer.ByteBuf;
@@ -40,9 +41,11 @@ public class CursorStreamAbortIntercept extends HttpProxyIntercept {
     public void beforeRequest(Channel clientChannel, HttpRequest httpRequest,
                               HttpProxyInterceptPipeline pipeline) throws Exception {
         String host = hostFrom(httpRequest);
+//        boolean watch = host != null && host.toLowerCase().contains("cursor.sh") && host.toLowerCase().contains("api") && StrUtil.isNotBlank(httpRequest.uri()) && httpRequest.uri().contains("agent.v1.AgentService");
         boolean watch = host != null && host.toLowerCase().contains("cursor.sh") && host.toLowerCase().contains("api");
         if (watch) {
             CursorAbortState st = new CursorAbortState();
+            st.requestUri = httpRequest.uri();
             st.abortNeedle = abortToken.getBytes(StandardCharsets.UTF_8);
             st.overlap = Math.max(0, st.abortNeedle.length - 1);
             clientChannel.attr(STATE).set(st);
@@ -96,8 +99,10 @@ public class CursorStreamAbortIntercept extends HttpProxyIntercept {
         buf.getBytes(buf.readerIndex(), chunk);
 
         if (containsAbortPattern(st.tail, chunk, needle)) {
+            final String uriForLog = st.requestUri != null ? st.requestUri : "";
             LOG.info(() -> String.format(
-                    "[CursorAbort] token matched, forwarding chunk then closing upstream (bytes=%d)", n));
+                    "匹配到了[CursorAbort] token matched uri=%s, forwarding chunk then closing upstream (bytes=%d)",
+                    uriForLog, n));
             pipeline.afterResponse(clientChannel, proxyChannel, httpContent);
             st.aborted = true;
             finishAndClose(clientChannel, proxyChannel, resp, httpContent);
@@ -212,6 +217,7 @@ public class CursorStreamAbortIntercept extends HttpProxyIntercept {
     }
 
     static final class CursorAbortState {
+        String requestUri;
         byte[] abortNeedle;
         int overlap;
         byte[] tail;
