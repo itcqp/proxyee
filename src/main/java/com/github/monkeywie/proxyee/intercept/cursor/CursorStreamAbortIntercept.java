@@ -168,16 +168,25 @@ public class CursorStreamAbortIntercept extends HttpProxyIntercept {
     }
 
     static boolean containsAbortPattern(byte[] prevTail, byte[] chunk, byte[] needle) {
-        if (needle.length == 0) {
-            return false;
+        return findAbortNeedleStartIndex(prevTail, chunk, needle) >= 0;
+    }
+
+    /**
+     * 在 {@code prevTail + chunk} 拼接缓冲中查找 needle 首次出现的起始下标；未找到返回 -1。
+     */
+    static int findAbortNeedleStartIndex(byte[] prevTail, byte[] chunk, byte[] needle) {
+        if (needle == null || needle.length == 0) {
+            return -1;
         }
         int pl = prevTail == null ? 0 : prevTail.length;
-        int cl = chunk.length;
+        int cl = chunk == null ? 0 : chunk.length;
         byte[] hay = new byte[pl + cl];
         if (pl > 0) {
             System.arraycopy(prevTail, 0, hay, 0, pl);
         }
-        System.arraycopy(chunk, 0, hay, pl, cl);
+        if (cl > 0) {
+            System.arraycopy(chunk, 0, hay, pl, cl);
+        }
         outer:
         for (int i = 0; i + needle.length <= hay.length; i++) {
             for (int j = 0; j < needle.length; j++) {
@@ -185,9 +194,9 @@ public class CursorStreamAbortIntercept extends HttpProxyIntercept {
                     continue outer;
                 }
             }
-            return true;
+            return i;
         }
-        return false;
+        return -1;
     }
 
     static byte[] suffixForOverlap(byte[] chunk, int needleLen) {
