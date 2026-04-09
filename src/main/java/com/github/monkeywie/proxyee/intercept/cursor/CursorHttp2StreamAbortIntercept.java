@@ -448,15 +448,60 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                             }
                             String text = sanitizeAssistantText(
                                     ConnectProtoUtil.extractTextFromResponseLenient(effectivePayload));
+                            byte[] turnEndedFrame = buildAgentTurnEndedFrame();
+                            byte[] connectTrailerFrame = buildConnectSuccessEndStreamFrame();
+                            // #region agent log
+                            dbg("abort-finalize", "H10",
+                                    "CursorHttp2StreamAbortIntercept.streamUnifiedChatAsAgentRunSse",
+                                    "abort_finalize_plan",
+                                    "{\"frameIdx\":" + frameIdx
+                                            + ",\"reason\":\"raw_assistant_abort\""
+                                            + ",\"forwardTextLen\":" + (text == null ? 0 : text.length())
+                                            + ",\"turnEndedLen\":" + (turnEndedFrame == null ? 0 : turnEndedFrame.length)
+                                            + ",\"connectTrailerLen\":" + (connectTrailerFrame == null ? 0 : connectTrailerFrame.length)
+                                            + ",\"sendConnectTrailer\":true"
+                                            + ",\"finishWithHttpLastContent\":true}");
+                            // #endregion
                             if (text != null && !text.isEmpty()) {
                                 writeConnectFrame(clientChannel, buildAgentTextDeltaFrame(text));
                             }
                             if (!turnEndedSent) {
-                                writeConnectFrame(clientChannel, buildAgentTurnEndedFrame());
+                                ChannelFuture turnEndedFuture = writeConnectFrameFuture(clientChannel, turnEndedFrame);
+                                if (turnEndedFuture != null) {
+                                    turnEndedFuture.addListener(f -> {
+                                        // #region agent log
+                                        dbg("abort-finalize", "H11",
+                                                "CursorHttp2StreamAbortIntercept.streamUnifiedChatAsAgentRunSse",
+                                                "abort_turn_ended_flush_done",
+                                                "{\"reason\":\"raw_assistant_abort\""
+                                                        + ",\"success\":" + f.isSuccess()
+                                                        + ",\"cause\":\""
+                                                        + esc(f.cause() == null ? null : String.valueOf(f.cause()))
+                                                        + "\"}");
+                                        // #endregion
+                                    });
+                                }
                                 turnEndedSent = true;
                             }
+                            ChannelFuture connectTrailerFuture =
+                                    writeConnectFrameFuture(clientChannel, connectTrailerFrame);
+                            if (connectTrailerFuture != null) {
+                                connectTrailerFuture.addListener(f -> {
+                                    // #region agent log
+                                    dbg("abort-finalize", "H12",
+                                            "CursorHttp2StreamAbortIntercept.streamUnifiedChatAsAgentRunSse",
+                                            "abort_connect_trailer_flush_done",
+                                            "{\"reason\":\"raw_assistant_abort\""
+                                                    + ",\"success\":" + f.isSuccess()
+                                                    + ",\"cause\":\""
+                                                    + esc(f.cause() == null ? null : String.valueOf(f.cause()))
+                                                    + "\"}");
+                                    // #endregion
+                                });
+                            }
                             call.cancel();
-                            finishChunkedResponse(clientChannel, keepAlive);
+                            finishChunkedResponseTracked(clientChannel, keepAlive,
+                                    "abort-finalize", "H11", "raw_assistant_abort");
                             return;
                         }
                     }
@@ -492,15 +537,60 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                                             + "\",\"forwardTextPreview\":\""
                                             + esc(oneLinePreview(forwardText, 120)) + "\"}");
                             // #endregion
+                            byte[] turnEndedFrame = buildAgentTurnEndedFrame();
+                            byte[] connectTrailerFrame = buildConnectSuccessEndStreamFrame();
+                            // #region agent log
+                            dbg("abort-finalize", "H10",
+                                    "CursorHttp2StreamAbortIntercept.streamUnifiedChatAsAgentRunSse",
+                                    "abort_finalize_plan",
+                                    "{\"frameIdx\":" + frameIdx
+                                            + ",\"reason\":\"emitted_text_abort\""
+                                            + ",\"forwardTextLen\":" + forwardText.length()
+                                            + ",\"turnEndedLen\":" + (turnEndedFrame == null ? 0 : turnEndedFrame.length)
+                                            + ",\"connectTrailerLen\":" + (connectTrailerFrame == null ? 0 : connectTrailerFrame.length)
+                                            + ",\"sendConnectTrailer\":true"
+                                            + ",\"finishWithHttpLastContent\":true}");
+                            // #endregion
                             if (!forwardText.isEmpty()) {
                                 writeConnectFrame(clientChannel, buildAgentTextDeltaFrame(forwardText));
                             }
                             if (!turnEndedSent) {
-                                writeConnectFrame(clientChannel, buildAgentTurnEndedFrame());
+                                ChannelFuture turnEndedFuture = writeConnectFrameFuture(clientChannel, turnEndedFrame);
+                                if (turnEndedFuture != null) {
+                                    turnEndedFuture.addListener(f -> {
+                                        // #region agent log
+                                        dbg("abort-finalize", "H11",
+                                                "CursorHttp2StreamAbortIntercept.streamUnifiedChatAsAgentRunSse",
+                                                "abort_turn_ended_flush_done",
+                                                "{\"reason\":\"emitted_text_abort\""
+                                                        + ",\"success\":" + f.isSuccess()
+                                                        + ",\"cause\":\""
+                                                        + esc(f.cause() == null ? null : String.valueOf(f.cause()))
+                                                        + "\"}");
+                                        // #endregion
+                                    });
+                                }
                                 turnEndedSent = true;
                             }
+                            ChannelFuture connectTrailerFuture =
+                                    writeConnectFrameFuture(clientChannel, connectTrailerFrame);
+                            if (connectTrailerFuture != null) {
+                                connectTrailerFuture.addListener(f -> {
+                                    // #region agent log
+                                    dbg("abort-finalize", "H12",
+                                            "CursorHttp2StreamAbortIntercept.streamUnifiedChatAsAgentRunSse",
+                                            "abort_connect_trailer_flush_done",
+                                            "{\"reason\":\"emitted_text_abort\""
+                                                    + ",\"success\":" + f.isSuccess()
+                                                    + ",\"cause\":\""
+                                                    + esc(f.cause() == null ? null : String.valueOf(f.cause()))
+                                                    + "\"}");
+                                    // #endregion
+                                });
+                            }
                             call.cancel();
-                            finishChunkedResponse(clientChannel, keepAlive);
+                            finishChunkedResponseTracked(clientChannel, keepAlive,
+                                    "abort-finalize", "H11", "emitted_text_abort");
                             return;
                         }
                         textFrames++;
@@ -906,10 +996,14 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
     }
 
     private static void writeConnectFrame(Channel clientChannel, byte[] wireFrame) {
+        writeConnectFrameFuture(clientChannel, wireFrame);
+    }
+
+    private static ChannelFuture writeConnectFrameFuture(Channel clientChannel, byte[] wireFrame) {
         if (wireFrame == null || wireFrame.length == 0 || !clientChannel.isActive()) {
-            return;
+            return null;
         }
-        clientChannel.writeAndFlush(new DefaultHttpContent(Unpooled.wrappedBuffer(wireFrame)));
+        return clientChannel.writeAndFlush(new DefaultHttpContent(Unpooled.wrappedBuffer(wireFrame)));
     }
 
     private HttpHeaders buildForwardHeaders(DownstreamRequest request) {
@@ -1901,6 +1995,10 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         }
     }
 
+    private static byte[] buildConnectSuccessEndStreamFrame() {
+        return buildWireFrame(2, utf8("{}"));
+    }
+
     private static byte[] utf8(String s) {
         return s == null ? new byte[0] : s.getBytes(StandardCharsets.UTF_8);
     }
@@ -2086,6 +2184,41 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         }
         ChannelFuture future = clientChannel.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
         future.addListener(f -> finalizeResponse(clientChannel, keepAlive));
+    }
+
+    private void finishChunkedResponseTracked(Channel clientChannel, boolean keepAlive,
+                                              String runId, String hypothesisId, String reason) {
+        if (!clientChannel.isActive()) {
+            // #region agent log
+            dbg(runId, hypothesisId,
+                    "CursorHttp2StreamAbortIntercept.finishChunkedResponseTracked",
+                    "abort_http_last_chunk_skipped_inactive",
+                    "{\"reason\":\"" + esc(reason) + "\"}");
+            // #endregion
+            completeCurrentResponse(clientChannel);
+            return;
+        }
+        // #region agent log
+        dbg(runId, hypothesisId,
+                "CursorHttp2StreamAbortIntercept.finishChunkedResponseTracked",
+                "abort_http_last_chunk_enqueued",
+                "{\"reason\":\"" + esc(reason)
+                        + "\",\"keepAlive\":" + keepAlive + "}");
+        // #endregion
+        ChannelFuture future = clientChannel.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
+        future.addListener(f -> {
+            // #region agent log
+            dbg(runId, hypothesisId,
+                    "CursorHttp2StreamAbortIntercept.finishChunkedResponseTracked",
+                    "abort_http_last_chunk_flushed",
+                    "{\"reason\":\"" + esc(reason)
+                            + "\",\"success\":" + f.isSuccess()
+                            + ",\"cause\":\""
+                            + esc(f.cause() == null ? null : String.valueOf(f.cause()))
+                            + "\"}");
+            // #endregion
+            finalizeResponse(clientChannel, keepAlive);
+        });
     }
 
     private void writeAndFinalize(Channel clientChannel,
