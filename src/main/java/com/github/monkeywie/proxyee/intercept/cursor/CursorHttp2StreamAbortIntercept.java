@@ -77,9 +77,17 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             "https://api2.cursor.sh/aiserver.v1.ChatService/StreamUnifiedChatWithTools";
     private static final Pattern RICHTEXT_TEXT_PATTERN =
             Pattern.compile("\\\"text\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\\\\\"])*)\\\"");
+    private static final Pattern LEADING_CONNECT_UUID_PREFIX_PATTERN =
+            Pattern.compile("^(?:[\\u0000-\\u001F\\uFFFD]*\\$[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})+");
+    private static final Pattern LEADING_CONTROL_GARBAGE_PATTERN =
+            Pattern.compile("^[\\u0000-\\u001F\\uFFFD]+");
     private static final ConcurrentHashMap<String, String> SESSION_PROMPT_CACHE =
             new ConcurrentHashMap<String, String>();
     private static final ConcurrentHashMap<String, String> REQUEST_PROMPT_CACHE =
+            new ConcurrentHashMap<String, String>();
+    private static final ConcurrentHashMap<String, String> SESSION_RULES_CACHE =
+            new ConcurrentHashMap<String, String>();
+    private static final ConcurrentHashMap<String, String> REQUEST_RULES_CACHE =
             new ConcurrentHashMap<String, String>();
 
     public static final String DEFAULT_ABORT_TOKEN = "zmgnb666";
@@ -252,7 +260,11 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                 }
             });
         } catch (Exception e) {
-            LOG.log(Level.SEVERE, "[H2Proxy] Build upstream request failed", e);
+            if (isExpectedMissingBidiPrompt(e)) {
+                LOG.info("[H2Proxy] Skip early RunSSE without cached Bidi prompt: " + e.getMessage());
+            } else {
+                LOG.log(Level.SEVERE, "[H2Proxy] Build upstream request failed", e);
+            }
             sendPlainAsync(clientChannel,
                     HttpResponseStatus.BAD_GATEWAY,
                     "Proxy build failed: " + e.getMessage(),
@@ -383,6 +395,8 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         int totalFrames = 0;
         int dataFrames = 0;
         int textFrames = 0;
+        String abortToken = new String(abortTokenBytes, StandardCharsets.UTF_8);
+        StringBuilder emittedTextWindow = new StringBuilder();
         try (InputStream is = body.byteStream();
              DataInputStream dis = new DataInputStream(new BufferedInputStream(is))) {
             int frameIdx = 0;
@@ -432,7 +446,8 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                                     effectivePayload = cleanedPayload;
                                 }
                             }
-                            String text = ConnectProtoUtil.extractTextFromResponseLenient(effectivePayload);
+                            String text = sanitizeAssistantText(
+                                    ConnectProtoUtil.extractTextFromResponseLenient(effectivePayload));
                             if (text != null && !text.isEmpty()) {
                                 writeConnectFrame(clientChannel, buildAgentTextDeltaFrame(text));
                             }
@@ -446,8 +461,48 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                         }
                     }
 
-                    String text = ConnectProtoUtil.extractTextFromResponseLenient(effectivePayload);
+                    String rawText = ConnectProtoUtil.extractTextFromResponseLenient(effectivePayload);
+                    String text = sanitizeAssistantText(rawText);
                     if (text != null && !text.isEmpty()) {
+                        emittedTextWindow.append(text);
+                        if (emittedTextWindow.length() > 4096) {
+                            emittedTextWindow.delete(0, emittedTextWindow.length() - 4096);
+                        }
+                        if (emittedTextWindow.indexOf(abortToken) >= 0) {
+                            String beforeToken = emittedTextWindow.substring(0, emittedTextWindow.indexOf(abortToken));
+                            String currentPrefix = beforeToken.length() > 0 && beforeToken.length() >= text.length()
+                                    ? beforeToken.substring(Math.max(0, beforeToken.length() - text.length()))
+                                    : beforeToken;
+                            String safeCurrent = text;
+                            if (currentPrefix != null && !currentPrefix.isEmpty()
+                                    && safeCurrent.startsWith(currentPrefix)) {
+                                safeCurrent = safeCurrent.substring(currentPrefix.length());
+                            }
+                            int abortInCurrent = safeCurrent.indexOf(abortToken);
+                            String forwardText = abortInCurrent >= 0
+                                    ? safeCurrent.substring(0, abortInCurrent)
+                                    : "";
+                            // #region agent log
+                            dbg("abort-scan", "H9",
+                                    "CursorHttp2StreamAbortIntercept.streamUnifiedChatAsAgentRunSse",
+                                    "abort_token_detected_in_emitted_text",
+                                    "{\"frameIdx\":" + frameIdx
+                                            + ",\"windowPreview\":\""
+                                            + esc(oneLinePreview(emittedTextWindow.toString(), 200))
+                                            + "\",\"forwardTextPreview\":\""
+                                            + esc(oneLinePreview(forwardText, 120)) + "\"}");
+                            // #endregion
+                            if (!forwardText.isEmpty()) {
+                                writeConnectFrame(clientChannel, buildAgentTextDeltaFrame(forwardText));
+                            }
+                            if (!turnEndedSent) {
+                                writeConnectFrame(clientChannel, buildAgentTurnEndedFrame());
+                                turnEndedSent = true;
+                            }
+                            call.cancel();
+                            finishChunkedResponse(clientChannel, keepAlive);
+                            return;
+                        }
                         textFrames++;
                         LOG.info("[H2Proxy] Bridged Frame#" + frameIdx
                                 + " text(" + text.length() + "): " + trunc(text, 300));
@@ -460,7 +515,8 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                                     "bridge_first_text_frame",
                                     "{\"frameIdx\":" + frameIdx
                                             + ",\"compressed\":" + compressed
-                                            + ",\"upstreamTextPreview\":\"" + esc(oneLinePreview(text, 120))
+                                            + ",\"rawUpstreamTextPreview\":\"" + esc(oneLinePreview(rawText, 120))
+                                            + "\",\"sanitizedTextPreview\":\"" + esc(oneLinePreview(text, 120))
                                             + "\",\"clientWireLen\":" + (clientWire == null ? 0 : clientWire.length)
                                             + "}");
                             // #endregion
@@ -522,6 +578,8 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         try (InputStream is = body.byteStream();
              DataInputStream dis = new DataInputStream(new BufferedInputStream(is))) {
             int frameIdx = 0;
+            StringBuilder assistantWindow = new StringBuilder();
+            StringBuilder assistantWindowNoSep = new StringBuilder();
             while (clientChannel.isActive()) {
                 int typeByte;
                 try {
@@ -548,6 +606,40 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                     if (decompressed != null) {
                         String text = ConnectProtoUtil.extractTextFromResponseLenient(decompressed);
                         if (text != null && !text.isEmpty()) {
+                            String sanitized = sanitizeAssistantText(text);
+                            if (sanitized != null && !sanitized.isEmpty()) {
+                                if (assistantWindow.length() > 0 && assistantWindow.length() < 4096) {
+                                    assistantWindow.append('\n');
+                                }
+                                assistantWindow.append(sanitized);
+                                if (assistantWindow.length() > 4096) {
+                                    assistantWindow.delete(0, assistantWindow.length() - 4096);
+                                }
+                                assistantWindowNoSep.append(sanitized);
+                                if (assistantWindowNoSep.length() > 4096) {
+                                    assistantWindowNoSep.delete(0, assistantWindowNoSep.length() - 4096);
+                                }
+                                if (assistantWindow.indexOf(new String(abortTokenBytes, StandardCharsets.UTF_8)) >= 0) {
+                                    // #region agent log
+                                    dbg("abort-scan", "H8",
+                                            "CursorHttp2StreamAbortIntercept.streamWithAbortDetection",
+                                            "abort_token_seen_in_accumulated_window",
+                                            "{\"frameIdx\":" + frameIdx
+                                                    + ",\"windowPreview\":\""
+                                                    + esc(oneLinePreview(assistantWindow.toString(), 200)) + "\"}");
+                                    // #endregion
+                                }
+                                if (assistantWindowNoSep.indexOf(new String(abortTokenBytes, StandardCharsets.UTF_8)) >= 0) {
+                                    // #region agent log
+                                    dbg("abort-scan", "H8",
+                                            "CursorHttp2StreamAbortIntercept.streamWithAbortDetection",
+                                            "abort_token_seen_in_accumulated_window_no_sep",
+                                            "{\"frameIdx\":" + frameIdx
+                                                    + ",\"windowPreview\":\""
+                                                    + esc(oneLinePreview(assistantWindowNoSep.toString(), 200)) + "\"}");
+                                    // #endregion
+                                }
+                            }
                             LOG.info("[H2Proxy] Frame#" + frameIdx
                                     + " text(" + text.length() + "): " + trunc(text, 300));
                         }
@@ -557,6 +649,17 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                             byte[] prefix = Arrays.copyOfRange(decompressed, 0, needleIdx);
                             boolean isAssistant =
                                     ConnectProtoUtil.lastRoleBeforeNeedleIsAssistant(prefix);
+                            // #region agent log
+                            dbg("abort-scan", "H7",
+                                    "CursorHttp2StreamAbortIntercept.streamWithAbortDetection",
+                                    "abort_token_detected",
+                                    "{\"frameIdx\":" + frameIdx
+                                            + ",\"needleIdx\":" + needleIdx
+                                            + ",\"compressed\":" + compressed
+                                            + ",\"isAssistant\":" + isAssistant
+                                            + ",\"textPreview\":\""
+                                            + esc(oneLinePreview(sanitizeAssistantText(text), 160)) + "\"}");
+                            // #endregion
                             if (isAssistant) {
                                 LOG.info("[H2Proxy] *** ABORT TOKEN matched at frame#" + frameIdx + " ***");
                                 byte[] cleaned = ConnectProtoUtil.removeAbortTokenFromWire(
@@ -571,6 +674,15 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                                 finishChunkedResponse(clientChannel, keepAlive);
                                 return;
                             }
+                            // #region agent log
+                            dbg("abort-scan", "H7",
+                                    "CursorHttp2StreamAbortIntercept.streamWithAbortDetection",
+                                    "abort_token_ignored_non_assistant",
+                                    "{\"frameIdx\":" + frameIdx
+                                            + ",\"needleIdx\":" + needleIdx
+                                            + ",\"textPreview\":\""
+                                            + esc(oneLinePreview(sanitizeAssistantText(text), 160)) + "\"}");
+                            // #endregion
                             LOG.info("[H2Proxy] Abort token in rule/thinking, ignoring");
                         }
                     }
@@ -852,8 +964,9 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             }
             if (cachedPrompt != null && !cachedPrompt.trim().isEmpty()) {
                 String model = chooseBridgedModel(sessionModel, resolution);
+                String extraSystemPrompt = findCachedRulesContext(request);
                 byte[] built = CursorConnectUpstreamCodec.buildFramedUnifiedChatBody(
-                        model, cachedPrompt);
+                        model, cachedPrompt, extraSystemPrompt);
                 // #region agent log
                 dbg(runId, "H2",
                         "CursorHttp2StreamAbortIntercept.buildUpstreamBody",
@@ -861,6 +974,9 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                         "{\"finalModel\":\"" + esc(model)
                                 + "\",\"promptSource\":\"bidi_cache"
                                 + "\",\"promptPreview\":\"" + esc(oneLinePreview(cachedPrompt, 120))
+                                + "\",\"rulesContextLen\":" + (extraSystemPrompt == null ? 0 : extraSystemPrompt.length())
+                                + ",\"rulesContextPreview\":\""
+                                + esc(oneLinePreview(extraSystemPrompt, 180))
                                 + "\",\"outLen\":" + built.length + "}");
                 // #endregion
                 LOG.info("[H2Proxy] Body: RunSSE->UnifiedChat from cached Bidi prompt, len="
@@ -902,7 +1018,9 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             }
             throw new IllegalStateException("Cannot bridge RunSSE body to UnifiedChat");
         } catch (Exception e) {
-            LOG.log(Level.WARNING, "[H2Proxy] RunSSE bridge body conversion failed", e);
+            if (!isExpectedMissingBidiPrompt(e)) {
+                LOG.log(Level.WARNING, "[H2Proxy] RunSSE bridge body conversion failed", e);
+            }
             throw new IllegalStateException("RunSSE bridge body conversion failed: " + e.getMessage(), e);
         }
     }
@@ -954,6 +1072,24 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         return null;
     }
 
+    private String findCachedRulesContext(DownstreamRequest request) {
+        String requestId = extractRequestIdFromRunSseBody(request.body);
+        if (requestId != null) {
+            String cached = REQUEST_RULES_CACHE.get(requestId);
+            if (cached != null && !cached.trim().isEmpty()) {
+                return cached;
+            }
+        }
+        String sessionId = headerFirst(request.headers, "x-session-id");
+        if (sessionId != null) {
+            String cached = SESSION_RULES_CACHE.get(sessionId);
+            if (cached != null && !cached.trim().isEmpty()) {
+                return cached;
+            }
+        }
+        return null;
+    }
+
     private void cacheBidiContext(FullHttpRequest request, HttpProxyInterceptPipeline pipeline) {
         byte[] body = extractBody(request);
         String normalizedPath = normalizePath(request.uri());
@@ -976,10 +1112,25 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         String structuredModel = null;
         String structuredText = null;
         String structuredRichText = null;
+        String rulesContext = null;
         if (agentClientMsg != null && agentClientMsg.length > 0) {
             byte[] runRequest = extractMessageField(agentClientMsg, 1);
             byte[] conversationAction = extractMessageField(agentClientMsg, 4);
             byte[] action = null;
+            byte[] conversationState = null;
+            byte[] requestContext = null;
+            byte[] selectedContext = null;
+            byte[] skillOptions = null;
+            String rulePathsPreview = null;
+            int prependUserMessagesCount = 0;
+            int requestContextRulesCount = 0;
+            int selectedCursorRulesCount = 0;
+            int selectedFilesCount = 0;
+            int extraContextCount = 0;
+            int rootPromptMessagesCount = 0;
+            int turnCount = 0;
+            int skillDescriptorsCount = 0;
+            int customSystemPromptLen = 0;
             if (runRequest != null) {
                 topMessage = "run_request";
                 action = extractMessageField(runRequest, 2);
@@ -989,6 +1140,11 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                         extractStringField(requestedModel, 1),
                         extractStringField(modelDetails, 1),
                         extractStringField(modelDetails, 3));
+                conversationState = extractMessageField(runRequest, 1);
+                String customSystemPrompt = extractStringField(runRequest, 8);
+                customSystemPromptLen = customSystemPrompt == null ? 0 : customSystemPrompt.length();
+                rootPromptMessagesCount = countLengthDelimitedField(conversationState, 1);
+                turnCount = countLengthDelimitedField(conversationState, 8);
             } else if (conversationAction != null) {
                 topMessage = "conversation_action";
                 action = conversationAction;
@@ -999,6 +1155,35 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             byte[] userMessage = extractMessageField(userMessageAction, 1);
             structuredText = extractStringField(userMessage, 1);
             structuredRichText = extractStringField(userMessage, 8);
+            requestContext = extractMessageField(userMessageAction, 2);
+            prependUserMessagesCount = countLengthDelimitedField(userMessageAction, 4);
+            selectedContext = extractMessageField(userMessage, 3);
+            requestContextRulesCount = countLengthDelimitedField(requestContext, 2);
+            rulePathsPreview = extractRulePathsPreview(requestContext, 20);
+            skillOptions = extractMessageField(requestContext, 18);
+            skillDescriptorsCount = countLengthDelimitedField(skillOptions, 1);
+            selectedCursorRulesCount = countLengthDelimitedField(selectedContext, 10);
+            selectedFilesCount = countLengthDelimitedField(selectedContext, 4);
+            extraContextCount = countLengthDelimitedField(selectedContext, 3);
+            rulesContext = extractRulesContext(requestContext);
+            // #region agent log
+            dbg(debugRunId(request.headers(), outerRequestId), "H6",
+                    "CursorHttp2StreamAbortIntercept.cacheBidiContext",
+                    "bidi_context_probe",
+                    "{\"topMessage\":\"" + esc(topMessage)
+                            + "\",\"rootPromptMessagesCount\":" + rootPromptMessagesCount
+                            + ",\"turnCount\":" + turnCount
+                            + ",\"customSystemPromptLen\":" + customSystemPromptLen
+                            + ",\"prependUserMessagesCount\":" + prependUserMessagesCount
+                            + ",\"requestContextRulesCount\":" + requestContextRulesCount
+                            + ",\"rulePathsPreview\":\"" + esc(rulePathsPreview)
+                            + "\""
+                            + ",\"skillDescriptorsCount\":" + skillDescriptorsCount
+                            + ",\"selectedCursorRulesCount\":" + selectedCursorRulesCount
+                            + ",\"selectedFilesCount\":" + selectedFilesCount
+                            + ",\"extraContextCount\":" + extraContextCount
+                            + ",\"rulesContextLen\":" + (rulesContext == null ? 0 : rulesContext.length()) + "}");
+            // #endregion
         }
         if (sessionId != null && !sessionId.isEmpty()
                 && structuredModel != null && !structuredModel.isEmpty()) {
@@ -1033,6 +1218,14 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         if (requestId != null && !requestId.isEmpty()) {
             REQUEST_PROMPT_CACHE.put(requestId, prompt);
         }
+        if (rulesContext != null && !rulesContext.trim().isEmpty()) {
+            if (sessionId != null && !sessionId.isEmpty()) {
+                SESSION_RULES_CACHE.put(sessionId, rulesContext);
+            }
+            if (requestId != null && !requestId.isEmpty()) {
+                REQUEST_RULES_CACHE.put(requestId, rulesContext);
+            }
+        }
         // #region agent log
         dbg(debugRunId(request.headers(), requestId), "H1",
                 "CursorHttp2StreamAbortIntercept.cacheBidiContext",
@@ -1042,6 +1235,7 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                         + "\",\"promptLen\":" + prompt.length()
                         + ",\"promptPreview\":\"" + esc(oneLinePreview(prompt, 120))
                         + "\",\"promptLooksUuid\":" + looksLikeUuid(prompt)
+                        + ",\"rulesContextLen\":" + (rulesContext == null ? 0 : rulesContext.length())
                         + ",\"sessionCacheModel\":\""
                         + esc(CursorSessionModelCache.getIfPresent(request.headers())) + "\"}");
         // #endregion
@@ -1119,6 +1313,59 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         Candidate best = new Candidate();
         collectUtf8Candidates(inner, 0, 6, best, false);
         return best.value == null ? null : best.value.trim();
+    }
+
+    private static String extractRulesContext(byte[] requestContext) {
+        if (requestContext == null || requestContext.length == 0) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (byte[] ruleMsg : extractRepeatedMessageFields(requestContext, 2)) {
+            String path = extractStringField(ruleMsg, 1);
+            String content = extractStringField(ruleMsg, 2);
+            if (content == null || content.trim().isEmpty()) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append("\n\n");
+            }
+            sb.append("Cursor rule");
+            if (path != null && !path.trim().isEmpty()) {
+                sb.append(" (").append(path.trim()).append(')');
+            }
+            sb.append(":\n").append(content.trim());
+        }
+        String cloudRule = extractStringField(requestContext, 16);
+        if (cloudRule != null && !cloudRule.trim().isEmpty()) {
+            if (sb.length() > 0) {
+                sb.append("\n\n");
+            }
+            sb.append("Cloud rule:\n").append(cloudRule.trim());
+        }
+        return sb.length() == 0 ? null : sb.toString();
+    }
+
+    private static String extractRulePathsPreview(byte[] requestContext, int limit) {
+        if (requestContext == null || requestContext.length == 0 || limit <= 0) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (byte[] ruleMsg : extractRepeatedMessageFields(requestContext, 2)) {
+            String path = extractStringField(ruleMsg, 1);
+            if (path == null || path.trim().isEmpty()) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(" | ");
+            }
+            sb.append(path.trim());
+            count++;
+            if (count >= limit) {
+                break;
+            }
+        }
+        return sb.length() == 0 ? null : sb.toString();
     }
 
     private static String findRichTextPayload(byte[] protobuf) {
@@ -1276,6 +1523,44 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             }
         }
         return null;
+    }
+
+    private static byte[][] extractRepeatedMessageFields(byte[] protobuf, int wantedField) {
+        if (protobuf == null || protobuf.length == 0) {
+            return new byte[0][];
+        }
+        java.util.ArrayList<byte[]> result = new java.util.ArrayList<byte[]>();
+        int pos = 0;
+        while (pos < protobuf.length) {
+            int[] tag = readTag(protobuf, pos);
+            if (tag == null) {
+                break;
+            }
+            int fieldNumber = tag[0];
+            int wireType = tag[1];
+            pos = tag[2];
+            if (wireType == 2) {
+                int[] len = readVarint(protobuf, pos);
+                if (len == null) {
+                    break;
+                }
+                int size = len[0];
+                pos = len[1];
+                if (size < 0 || pos + size > protobuf.length) {
+                    break;
+                }
+                if (fieldNumber == wantedField) {
+                    result.add(Arrays.copyOfRange(protobuf, pos, pos + size));
+                }
+                pos += size;
+            } else {
+                pos = skipField(protobuf, pos, wireType);
+                if (pos < 0) {
+                    break;
+                }
+            }
+        }
+        return result.toArray(new byte[result.size()][]);
     }
 
     private static Long extractVarintField(byte[] protobuf, int wantedField) {
@@ -1679,6 +1964,24 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         return best.isEmpty() ? null : best;
     }
 
+    private static String sanitizeAssistantText(String text) {
+        if (text == null || text.isEmpty()) {
+            return text;
+        }
+        String cleaned = LEADING_CONNECT_UUID_PREFIX_PATTERN.matcher(text).replaceFirst("");
+        cleaned = LEADING_CONTROL_GARBAGE_PATTERN.matcher(cleaned).replaceFirst("");
+        if (!cleaned.equals(text)) {
+            // #region agent log
+            dbg("bridge-stream", "H4",
+                    "CursorHttp2StreamAbortIntercept.sanitizeAssistantText",
+                    "bridge_text_sanitized",
+                    "{\"before\":\"" + esc(oneLinePreview(text, 120))
+                            + "\",\"after\":\"" + esc(oneLinePreview(cleaned, 120)) + "\"}");
+            // #endregion
+        }
+        return cleaned;
+    }
+
     private static boolean isRequestIdOnlyRunSseBody(byte[] body) {
         byte[] payload = ConnectProtoUtil.extractPayloadFromWire(body);
         if (payload == null || payload.length == 0) {
@@ -1705,6 +2008,56 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             }
         }
         return null;
+    }
+
+    private static boolean isExpectedMissingBidiPrompt(Throwable t) {
+        Throwable cur = t;
+        while (cur != null) {
+            String msg = cur.getMessage();
+            if (msg != null && msg.contains("RunSSE body only carries requestId; missing BidiAppend prompt")) {
+                return true;
+            }
+            cur = cur.getCause();
+        }
+        return false;
+    }
+
+    private static int countLengthDelimitedField(byte[] protobuf, int wantedField) {
+        if (protobuf == null || protobuf.length == 0) {
+            return 0;
+        }
+        int count = 0;
+        int pos = 0;
+        while (pos < protobuf.length) {
+            int[] tag = readTag(protobuf, pos);
+            if (tag == null) {
+                return count;
+            }
+            int fieldNumber = tag[0];
+            int wireType = tag[1];
+            pos = tag[2];
+            if (wireType == 2) {
+                int[] len = readVarint(protobuf, pos);
+                if (len == null) {
+                    return count;
+                }
+                int size = len[0];
+                pos = len[1];
+                if (size < 0 || pos + size > protobuf.length) {
+                    return count;
+                }
+                if (fieldNumber == wantedField) {
+                    count++;
+                }
+                pos += size;
+            } else {
+                pos = skipField(protobuf, pos, wireType);
+                if (pos < 0) {
+                    return count;
+                }
+            }
+        }
+        return count;
     }
 
     // ================================================================

@@ -145,6 +145,14 @@ public final class CursorConnectUpstreamCodec {
         return wrapGrpcFrame(protobufBody, false);
     }
 
+    public static byte[] buildFramedUnifiedChatBody(String model, String userText, String extraSystemPrompt)
+            throws IOException {
+        byte[] protobufBody = buildChatRequestProtobuf(
+                model,
+                Message.of(extraSystemPrompt, userText != null ? userText : ""));
+        return wrapGrpcFrame(protobufBody, false);
+    }
+
     /**
      * 构建 StreamUnifiedChatRequestWithTools 外层 protobuf（与 CursorChatUtil 一致）。
      */
