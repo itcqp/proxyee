@@ -1,1487 +1,1923 @@
 package com.github.monkeywie.proxyee.intercept.cursor;
 
+import com.github.monkeywie.proxyee.connect.ClientResponseGate;
 import com.github.monkeywie.proxyee.connect.ConnectProtoUtil;
-import com.github.monkeywie.proxyee.connect.CursorProxyDebugLog;
+import com.github.monkeywie.proxyee.connect.AgentRunSseModelResolver;
+import com.github.monkeywie.proxyee.connect.CursorConnectUpstreamCodec;
+import com.github.monkeywie.proxyee.connect.CursorSessionModelCache;
 import com.github.monkeywie.proxyee.connect.RunSseToUnifiedChatBodyConverter;
-import com.github.monkeywie.proxyee.connect.SseDownstreamFormatter;
-import com.github.monkeywie.proxyee.crt.CertUtil;
-import com.github.monkeywie.proxyee.server.HttpProxyServerConfig;
-import io.netty.bootstrap.Bootstrap;
-import io.netty.bootstrap.ServerBootstrap;
+import com.github.monkeywie.proxyee.intercept.HttpProxyIntercept;
+import com.github.monkeywie.proxyee.intercept.HttpProxyInterceptInitializer;
+import com.github.monkeywie.proxyee.intercept.HttpProxyInterceptPipeline;
 import io.netty.buffer.ByteBuf;
+import com.github.monkeywie.proxyee.server.HttpProxyServer;
+import com.github.monkeywie.proxyee.server.HttpProxyServerConfig;
 import io.netty.buffer.Unpooled;
-import io.netty.channel.*;
-import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.socket.SocketChannel;
-import io.netty.channel.socket.nio.NioServerSocketChannel;
-import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.codec.http.*;
-import io.netty.handler.codec.http2.*;
-import io.netty.handler.ssl.*;
-import io.netty.util.concurrent.Future;
-import io.netty.util.concurrent.FutureListener;
-import io.netty.util.concurrent.GenericFutureListener;
-import io.netty.util.concurrent.Promise;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.handler.codec.http.DefaultFullHttpResponse;
+import io.netty.handler.codec.http.DefaultHttpContent;
+import io.netty.handler.codec.http.DefaultHttpResponse;
+import io.netty.handler.codec.http.FullHttpRequest;
+import io.netty.handler.codec.http.FullHttpResponse;
+import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpHeaderValues;
+import io.netty.handler.codec.http.HttpHeaders;
+import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.codec.http.HttpObjectAggregator;
+import io.netty.handler.codec.http.HttpRequest;
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpUtil;
+import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.codec.http.LastHttpContent;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.Headers;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
 
-import javax.net.ssl.SSLException;
+import java.io.ByteArrayOutputStream;
+import java.io.BufferedInputStream;
+import java.io.DataInputStream;
+import java.io.EOFException;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
-import java.security.KeyPair;
-import java.security.PrivateKey;
-import java.security.cert.X509Certificate;
 import java.util.Arrays;
 import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import io.netty.util.ReferenceCountUtil;
 
 /**
- * Cursor HTTP/2 MITM 中转代理（独立 Netty 服务）。
- *
- * <p>客户端经 MITM 以 HTTP/1.1 访问 api2.cursor.sh；匹配到的聊天流用 HTTP/2 向上游转发：{@code Agent/RunSSE} 透传同一路径，
- * 其余多固定为 {@code /aiserver.v1.ChatService/StreamUnifiedChatWithTools}（与 {@link com.github.monkeywie.proxyee.CursorChatUtil} 中直连 Chat 一致）。
- * 若客户端 URI 为 {@code /agent.v1.AgentService/RunSSE}，则<strong>透传</strong>该 :path 与原始 Connect 请求体到上游（与 IDE 期望的 Agent 响应 protobuf 一致）。
- * 其他拦截路径（如直连 UnifiedChat）仍可将上游固定为 {@code StreamUnifiedChatWithTools}；仅当客户端误把非 Chat 体发到 Chat RPC 时才需改写（历史场景）。
- * 对 gRPC Connect 响应做<strong>解压后</strong>的终止串匹配，命中则停止后续 message、将<strong>当前帧完整</strong>下发（禁止截断 protobuf），再发 Connect 结束帧（msgType=1 空 JSON，与 {@link #CONNECT_END_STREAM_FRAME} 一致）或等价 SSE，最后在客户端 {@code LastHttpContent} flush <strong>成功</strong>后 RST 上游；{@code Agent/RunSSE} 与 UnifiedChat 均扫描。
- * <ul>
- *   <li>Agent {@code RunSSE}：上游 :path 与客户端一致；非 Agent 的拦截聊天仍可将上游固定为 {@code StreamUnifiedChatWithTools}。abort 扫描按 Connect 帧解压匹配；RunSSE 且上游 200：<strong>默认</strong>仍对客户端下发
- *   Connect 二进制分块（与 <a href="https://github.com/burpheart/cursor-tap">cursor-tap</a> 对「gRPC 请求 + 响应」按 {@code parseGRPCStream} 解析的模型一致；若响应为 SSE，其载荷仍是 Connect 帧而非 OpenAI JSON）。
- *   <strong>Agent {@code RunSSE}</strong>：即使上游 {@code Content-Type: text/event-stream}，载荷仍是 <strong>Connect 二进制分帧</strong>（借 SSE 头做无缓冲长连接），见
- *   <a href="https://github.com/burpheart/cursor-tap/blob/main/cursor-reverse-notes-1.md">cursor-tap 逆向笔记</a>；<strong>禁止</strong>转成 {@code data:} 文本 SSE。
- *   仅非 RunSSE 的拦截路径且客户端<strong>显式</strong> {@code Accept: text/event-stream} 时，才将帧格式化为标准 SSE 文本（{@link com.github.monkeywie.proxyee.connect.SseDownstreamFormatter#connectMsg0Json}）。</li>
- *   <li>其余 cursor.sh 请求 HTTP/2 透传，非 api2 域名 TCP 隧道</li>
- * </ul>
- * <p><strong>线程模型</strong>：MITM 客户端由 {@code workerGroup} 服务；到 {@code api2.cursor.sh} 的 TLS/H2 由专用 {@code upstreamEventLoopGroup}；
- * 上游 handler 内对客户端 {@link Channel} 的写经 {@link #runOnClient} 投递到客户端 I/O 线程，与上游解耦。
+ * 基于 proxyee MITM 的 Cursor 聊天拦截器：
+ * 接收客户端解密后的 HTTP/1.1 请求，转为上游 HTTPS/HTTP2，并在流式响应中命中 abort token 时截断。
  */
-public class CursorHttp2StreamAbortIntercept {
+public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
 
     private static final Logger LOG = Logger.getLogger(CursorHttp2StreamAbortIntercept.class.getName());
-
-    /**
-     * 每条上游流日志关联 id，避免多请求混在一起；不用于业务逻辑。
-     */
-    private static final AtomicLong CONNECT_ABORT_HANDLER_LOG_SEQ = new AtomicLong();
-    private static final AtomicLong RAW_ABORT_HANDLER_LOG_SEQ = new AtomicLong();
+    private static final String DEBUG_LOG_PATH = "d:/devin/playgame/proxyee63/debug-064e27.log";
+    private static final String DEBUG_RUNTIME_LOG_PATH = "D:/devin/playgame/proxyee63/debug-e2f75a.log";
+    private static final String DEBUG_RUNTIME_SESSION_ID = "e2f75a";
+    private static final int MAX_FULL_REQUEST_BYTES = 16 * 1024 * 1024;
+    private static final String AGGREGATOR_NAME = "cursorProxyAggregator";
+    private static final String UNIFIED_CHAT_UPSTREAM_URL =
+            "https://api2.cursor.sh/aiserver.v1.ChatService/StreamUnifiedChatWithTools";
+    private static final Pattern RICHTEXT_TEXT_PATTERN =
+            Pattern.compile("\\\"text\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\\\\\"])*)\\\"");
+    private static final ConcurrentHashMap<String, String> SESSION_PROMPT_CACHE =
+            new ConcurrentHashMap<String, String>();
+    private static final ConcurrentHashMap<String, String> REQUEST_PROMPT_CACHE =
+            new ConcurrentHashMap<String, String>();
 
     public static final String DEFAULT_ABORT_TOKEN = "zmgnb666";
 
-    private static final String CURSOR_API_HOST = "api2.cursor.sh";
-    private static final int CURSOR_API_PORT = 443;
-    /**
-     * 与 {@link com.github.monkeywie.proxyee.CursorChatUtil} 一致的上游 RPC 路径（代理与 Cursor 服务端强制使用）
-     */
-    private static final String FIXED_CHAT_UPSTREAM_PATH = "/aiserver.v1.ChatService/StreamUnifiedChatWithTools";
-    private static final String INTERCEPT_HOST_KEYWORD = "cursor.sh";
+    private final byte[] abortTokenBytes;
+    private final Consumer<HttpHeaders> headerModifier;
+    private final OkHttpClient okHttpClient;
 
-    private static boolean hostMatchesCursor(String host) {
-        return host != null && host.toLowerCase().contains(INTERCEPT_HOST_KEYWORD);
-    }
+    private HttpProxyServer proxyServer;
 
-    private static boolean shouldInterceptForAbort(String uri) {
-        return uri.contains("StreamUnifiedChatWithTools") || uri.contains("RunSSE") || uri.contains("agent.v1.AgentService");
-    }
-
-    /**
-     * 请求头是否显式要求 {@code text/event-stream}（不含「缺省」语义）。
-     */
-    private static boolean clientAcceptsEventStream(String acceptHeader) {
-        if (acceptHeader == null || acceptHeader.isEmpty()) {
-            return false;
-        }
-        return acceptHeader.toLowerCase().contains("text/event-stream");
-    }
-
-    /**
-     * 是否对客户端下发「真·SSE 文本」（{@code data:} 行）：仅当<strong>非</strong> Agent/RunSSE 路径且客户端显式要求 event-stream。
-     * Agent {@code RunSSE} 始终走 Connect 二进制（与 cursor-tap：假 SSE 真 Connect 帧 一致）。
-     */
-    private static boolean shouldEmitSseTextDownstream(boolean clientStartedAsRunSsePath, String acceptHeader) {
-        if (clientStartedAsRunSsePath) {
-            return false;
-        }
-        return clientAcceptsEventStream(acceptHeader);
-    }
-
-    /**
-     * 将 {@link FullHttpRequest#uri()} 规范为 HTTP/2 {@code :path}（以 {@code /} 开头，可带 query）。
-     * 避免部分客户端/代理把 path 写成 query 导致出现 {@code ?agent...} 等非法 :path。
-     */
-    private static String normalizeToHttp2Path(String uri) {
-        if (uri == null || uri.isEmpty()) {
-            return "/";
-        }
-        String s = uri.trim();
-        int sp = s.indexOf(' ');
-        if (sp > 0) {
-            s = s.substring(0, sp);
-        }
-        int hash = s.indexOf('#');
-        if (hash >= 0) {
-            s = s.substring(0, hash);
-        }
-        if (s.startsWith("http://") || s.startsWith("https://")) {
-            try {
-                URI u = URI.create(s);
-                String p = u.getRawPath();
-                if (p == null || p.isEmpty()) {
-                    p = "/";
-                }
-                String q = u.getRawQuery();
-                return q != null ? p + "?" + q : p;
-            } catch (Exception ignored) {
-                // fall through
-            }
-        }
-        if (s.startsWith("?")) {
-            return "/" + s.substring(1);
-        }
-        if (!s.startsWith("/")) {
-            s = "/" + s;
-        }
-        QueryStringDecoder dec = new QueryStringDecoder(s, false);
-        String p = dec.path();
-        String q = dec.rawQuery();
-        if (p.isEmpty() && q != null && !q.contains("=") && q.contains("/")) {
-            return "/" + q;
-        }
-        return q != null ? p + "?" + q : p;
-    }
-
-    /**
-     * 拦截到的聊天请求：默认上游为 UnifiedChat；{@code agent.v1.AgentService/RunSSE} 必须与客户端 :path 一致，
-     * 否则上游返回 Chat protobuf，而 connect-es 仍按 Agent 解码（流式异常）。
-     */
-    private static String resolveUpstreamPathForInterceptedChat(String clientUri) {
-        String norm = normalizeToHttp2Path(clientUri);
-        if (norm.contains("agent.v1.AgentService") && norm.contains("RunSSE")) {
-            return norm;
-        }
-        return FIXED_CHAT_UPSTREAM_PATH;
-    }
-
-    @FunctionalInterface
-    public interface HeaderModifier {
-        void modify(HttpHeaders headers);
-    }
-
-    private final byte[] abortNeedle;
-    private final HeaderModifier headerModifier;
-
-    private EventLoopGroup bossGroup;
-    private EventLoopGroup workerGroup;
-    /**
-     * 与 Cursor 上游 HTTPS/H2 专用，勿与 {@link #workerGroup} 混用。
-     */
-    private EventLoopGroup upstreamEventLoopGroup;
-    private Channel serverChannel;
-
-    private final AtomicReference<Channel> upstreamConnRef = new AtomicReference<>();
-    private final Object upstreamConnectLock = new Object();
-    /**
-     * 并发请求复用同一次建连时指向同一 Future，避免多条 Bootstrap。
-     */
-    private volatile Future<Channel> pendingUpstreamConnect;
-    private SslContext upstreamSslCtx;
-    private HttpProxyServerConfig mitmConfig;
-
-    public CursorHttp2StreamAbortIntercept() {
-        this(DEFAULT_ABORT_TOKEN, null);
-    }
-
-    public CursorHttp2StreamAbortIntercept(String abortToken) {
-        this(abortToken, null);
-    }
-
-    public CursorHttp2StreamAbortIntercept(String abortToken, HeaderModifier headerModifier) {
-        if (abortToken == null || abortToken.isEmpty()) {
-            throw new IllegalArgumentException("abortToken must not be empty");
-        }
-        this.abortNeedle = abortToken.getBytes(StandardCharsets.UTF_8);
+    public CursorHttp2StreamAbortIntercept(String abortToken,
+                                           Consumer<HttpHeaders> headerModifier) {
+        String actualAbortToken = abortToken != null ? abortToken : DEFAULT_ABORT_TOKEN;
+        this.abortTokenBytes = actualAbortToken.getBytes(StandardCharsets.UTF_8);
         this.headerModifier = headerModifier;
+        this.okHttpClient = new OkHttpClient.Builder()
+                .connectTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(180, TimeUnit.SECONDS)
+                .writeTimeout(30, TimeUnit.SECONDS)
+                .build();
     }
 
-    public void start(int port) throws Exception {
-        upstreamSslCtx = buildUpstreamSslContext();
-        mitmConfig = loadMitmConfig();
-
-        bossGroup = new NioEventLoopGroup(1);
-        workerGroup = new NioEventLoopGroup();
-        upstreamEventLoopGroup = new NioEventLoopGroup(1);
-
-        ServerBootstrap b = new ServerBootstrap();
-        b.group(bossGroup, workerGroup).channel(NioServerSocketChannel.class).childHandler(new ChannelInitializer<SocketChannel>() {
-            @Override
-            protected void initChannel(SocketChannel ch) {
-                ch.pipeline().addLast("httpCodec", new HttpServerCodec()).addLast("aggregator", new HttpObjectAggregator(10 * 1024 * 1024)).addLast("proxy", new ProxyHandler());
+    public void start(int port) {
+        HttpProxyServerConfig config = new HttpProxyServerConfig();
+        config.setHandleSsl(true);
+        config.setMitmMatcher(requestProto -> {
+            String host = requestProto == null ? null : requestProto.getHost();
+            if (host == null) {
+                return false;
             }
-        }).childOption(ChannelOption.AUTO_READ, true);
+            String lower = host.toLowerCase(Locale.ROOT);
+            return lower.contains("cursor.sh") || lower.contains("cursorapi.com");
+        });
 
-        serverChannel = b.bind(port).sync().channel();
-        LOG.info("[H2Proxy] server started on port " + port);
+        proxyServer = new HttpProxyServer()
+                .serverConfig(config)
+                .proxyInterceptInitializer(new HttpProxyInterceptInitializer() {
+                    @Override
+                    public void init(HttpProxyInterceptPipeline pipeline) {
+                        pipeline.addLast(CursorHttp2StreamAbortIntercept.this);
+                    }
+                });
+
+        proxyServer.startAsync(port).toCompletableFuture().join();
+        LOG.info("[H2Proxy] MITM proxy started on port " + port);
+        dl("CursorHttp2StreamAbortIntercept.start:" + port,
+                "SERVER_STARTED",
+                "{\"hypothesisId\":\"A\",\"port\":" + port + "}");
     }
 
     public void stop() {
-        if (serverChannel != null) serverChannel.close();
-        Channel conn = upstreamConnRef.get();
-        if (conn != null && conn.isActive()) conn.close();
-        if (bossGroup != null) bossGroup.shutdownGracefully();
-        if (workerGroup != null) workerGroup.shutdownGracefully();
-        if (upstreamEventLoopGroup != null) upstreamEventLoopGroup.shutdownGracefully();
-        LOG.info("[H2Proxy] server stopped");
+        if (proxyServer != null) {
+            proxyServer.close();
+            proxyServer = null;
+        }
+        okHttpClient.dispatcher().executorService().shutdown();
+        okHttpClient.connectionPool().evictAll();
     }
 
-    /**
-     * 在上游线程调用亦安全：下行写固定到客户端 {@link Channel} 的 I/O 线程。
-     */
-    private static void runOnClient(Channel client, Runnable r) {
-        EventLoop el = client.eventLoop();
-        if (el.inEventLoop()) {
-            r.run();
-        } else {
-            el.execute(r);
-        }
-    }
-
-    // ======================== ProxyHandler ========================
-
-    private class ProxyHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
-
-        @Override
-        protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest req) throws Exception {
-            logRequestHeaders(req);
-
-            if (HttpMethod.CONNECT.equals(req.method())) {
-                handleConnect(ctx, req);
-                return;
-            }
-
-            String host = req.headers().get(HttpHeaderNames.HOST);
-            String uri = req.uri();
-            String normUri = normalizeToHttp2Path(uri);
-            boolean abortIfRaw = shouldInterceptForAbort(uri);
-            boolean abortIfNorm = shouldInterceptForAbort(normUri);
-            boolean match = hostMatchesCursor(host) && (abortIfRaw || abortIfNorm);
-
-            if (match) {
-                LOG.info("[H2Proxy] intercepting Chat/RunSSE (abort scan): host=" + host + " uri=" + uri);
-                handleChatWithAbort(ctx, req);
-            } else {
-                LOG.info("[H2Proxy] relay (no abort): host=" + host + " uri=" + uri);
-                handleRelayViaH2(ctx, req);
-            }
-        }
-
-        /**
-         * CONNECT 隧道处理
-         */
-        private void handleConnect(ChannelHandlerContext ctx, FullHttpRequest req) {
-            String hostAndPort = req.uri();
-            String host = hostAndPort.contains(":") ? hostAndPort.substring(0, hostAndPort.lastIndexOf(':')) : hostAndPort;
-            int port = 443;
-            if (hostAndPort.contains(":")) {
-                try {
-                    port = Integer.parseInt(hostAndPort.substring(hostAndPort.lastIndexOf(':') + 1));
-                } catch (NumberFormatException ignored) {
-                }
-            }
-
-            boolean mitmApi2 = host.toLowerCase().equals(CURSOR_API_HOST);
-
-            if (mitmApi2) {
-                LOG.info("[H2Proxy] CONNECT to " + hostAndPort + " → MITM TLS");
-                doMitmConnect(ctx, host);
-            } else {
-                LOG.info("[H2Proxy] CONNECT to " + hostAndPort + " → TCP tunnel (passthrough)");
-                doTcpTunnel(ctx, host, port);
-            }
-        }
-
-        /**
-         * 对 api2.cursor.sh 做 MITM TLS（拆开 SSL 检查内部 HTTP 请求）
-         */
-        private void doMitmConnect(ChannelHandlerContext ctx, String host) {
-            DefaultHttpResponse resp = new DefaultHttpResponse(HttpVersion.HTTP_1_1, new HttpResponseStatus(200, "Connection Established"));
-            ctx.writeAndFlush(resp).addListener((ChannelFutureListener) f -> {
-                if (!f.isSuccess()) return;
-                SslContext mitmSsl = buildMitmSslContext(host);
-                ChannelPipeline p = ctx.pipeline();
-                p.remove("aggregator");
-                p.remove("httpCodec");
-                p.addFirst("mitmSsl", mitmSsl.newHandler(ctx.alloc()));
-                p.addAfter("mitmSsl", "httpCodec", new HttpServerCodec());
-                p.addAfter("httpCodec", "aggregator", new HttpObjectAggregator(10 * 1024 * 1024));
-            });
-        }
-
-        /**
-         * 对非 api2 的 cursor.sh 主机，建立 TCP 隧道直接透传（不做 MITM）
-         */
-        private void doTcpTunnel(ChannelHandlerContext ctx, String host, int port) {
-            Channel clientCh = ctx.channel();
-            Bootstrap b = new Bootstrap();
-            b.group(clientCh.eventLoop()).channel(NioSocketChannel.class).handler(new ChannelInitializer<SocketChannel>() {
-                @Override
-                protected void initChannel(SocketChannel ch) {
-                    ch.pipeline().addLast(new TunnelRelayHandler(clientCh));
-                }
-            });
-
-            b.connect(host, port).addListener((ChannelFutureListener) f -> {
-                if (!f.isSuccess()) {
-                    LOG.warning("[H2Proxy] TCP tunnel connect failed to " + host + ":" + port);
-                    sendError(clientCh);
-                    return;
-                }
-                Channel remoteCh = f.channel();
-                DefaultHttpResponse resp = new DefaultHttpResponse(HttpVersion.HTTP_1_1, new HttpResponseStatus(200, "Connection Established"));
-                clientCh.writeAndFlush(resp).addListener((ChannelFutureListener) wf -> {
-                    if (!wf.isSuccess()) {
-                        remoteCh.close();
-                        return;
-                    }
-                    ChannelPipeline p = ctx.pipeline();
-                    p.remove("aggregator");
-                    p.remove("httpCodec");
-                    p.remove("proxy");
-                    p.addLast(new TunnelRelayHandler(remoteCh));
-                });
-            });
-        }
-
-        /**
-         * 匹配 StreamUnifiedChat / RunSSE → HTTP/2 转发；Agent RunSSE 透传 path/body，其余拦截路径上游多为 UnifiedChat
-         */
-        private void handleChatWithAbort(ChannelHandlerContext ctx, FullHttpRequest req) {
-            HttpHeaders forwardHeaders = req.headers().copy();
-            if (headerModifier != null) {
-                headerModifier.modify(forwardHeaders);
-            }
-            String normPath = normalizeToHttp2Path(req.uri());
-            final boolean clientStartedAsRunSsePath = normPath.contains("RunSSE") || normPath.contains("agent.v1.AgentService");
-            final String clientAcceptHeader = forwardHeaders.get(HttpHeaderNames.ACCEPT);
-            final ByteBuf bodyCopy = RunSseToUnifiedChatBodyConverter.maybeRewriteBodyForUnifiedChat(req.content().copy(), normPath, forwardHeaders);
-            HttpMethod method = req.method();
-            String upstreamPath = resolveUpstreamPathForInterceptedChat(req.uri());
-            boolean connectFrameAbortScan = true;
-
-            getOrCreateUpstreamConn().addListener((GenericFutureListener<Future<Channel>>) future -> {
-                if (!future.isSuccess()) {
-                    bodyCopy.release();
-                    sendError(ctx.channel());
-                    return;
-                }
-                forwardViaHttp2(ctx.channel(), future.getNow(), bodyCopy, method, forwardHeaders, upstreamPath, true, connectFrameAbortScan, clientStartedAsRunSsePath, clientAcceptHeader);
-            });
-        }
-
-        /**
-         * 非匹配请求 → 走 HTTP/2 转发（不扫描，纯 relay）
-         */
-        private void handleRelayViaH2(ChannelHandlerContext ctx, FullHttpRequest req) {
-            HttpHeaders forwardHeaders = req.headers().copy();
-            ByteBuf bodyCopy = req.content().copy();
-            HttpMethod method = req.method();
-            String upstreamPath = normalizeToHttp2Path(req.uri());
-
-            getOrCreateUpstreamConn().addListener((GenericFutureListener<Future<Channel>>) future -> {
-                if (!future.isSuccess()) {
-                    bodyCopy.release();
-                    sendError(ctx.channel());
-                    return;
-                }
-                forwardViaHttp2(ctx.channel(), future.getNow(), bodyCopy, method, forwardHeaders, upstreamPath, false, false, false, forwardHeaders.get(HttpHeaderNames.ACCEPT));
-            });
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            LOG.log(Level.WARNING, "[H2Proxy] client channel error", cause);
-            ctx.close();
-        }
-    }
-
-    // ======================== TCP 隧道双向转发 ========================
-
-    private static class TunnelRelayHandler extends ChannelInboundHandlerAdapter {
-        private final Channel other;
-
-        TunnelRelayHandler(Channel other) {
-            this.other = other;
-        }
-
-        @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            if (other.isActive()) {
-                other.writeAndFlush(msg);
-            } else {
-                if (msg instanceof io.netty.util.ReferenceCounted) {
-                    ((io.netty.util.ReferenceCounted) msg).release();
-                }
-            }
-        }
-
-        @Override
-        public void channelInactive(ChannelHandlerContext ctx) {
-            if (other.isActive()) other.close();
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            ctx.close();
-            if (other.isActive()) other.close();
-        }
-    }
-
-    // ======================== HTTP/2 转发逻辑 ========================
-
-    /**
-     * @param scanAbort             true=扫描 abort token，false=纯 relay
-     * @param connectFrameAbortScan true=按 gRPC Connect 帧解压后匹配（拦截聊天路径）；false=按 HTTP/2 DATA 原始字节匹配（保留分支，当前拦截聊天恒为 true）
-     */
-    private void forwardViaHttp2(Channel clientChannel, Channel http2Conn, ByteBuf bodyCopy, HttpMethod method, HttpHeaders forwardHeaders, String upstreamPath, boolean scanAbort, boolean connectFrameAbortScan, boolean clientStartedAsRunSsePath, String clientAcceptHeader) {
-        if (!http2Conn.isActive()) {
-            bodyCopy.release();
-            sendError(clientChannel);
-            upstreamConnRef.set(null);
+    @Override
+    public void beforeRequest(Channel clientChannel, HttpRequest httpRequest,
+                              HttpProxyInterceptPipeline pipeline) throws Exception {
+        RouteKind routeKind = classifyRoute(httpRequest, pipeline);
+        if (routeKind == RouteKind.PASSTHROUGH) {
+            pipeline.beforeRequest(clientChannel, httpRequest);
             return;
         }
 
-        Http2StreamChannelBootstrap streamBoot = new Http2StreamChannelBootstrap(http2Conn);
-        if (!scanAbort) {
-            streamBoot.handler(new Http2RelayHandler(clientChannel));
-        } else if (connectFrameAbortScan) {
-            streamBoot.handler(new Http2ConnectFrameAbortHandler(clientChannel, abortNeedle, clientStartedAsRunSsePath, clientAcceptHeader, forwardHeaders));
-        } else {
-            streamBoot.handler(new Http2RawStreamAbortHandler(clientChannel, abortNeedle));
+        if (!(httpRequest instanceof FullHttpRequest)) {
+            ensureFullRequestAggregation(clientChannel, pipeline);
+            clientChannel.pipeline().fireChannelRead(httpRequest);
+            return;
         }
 
-        streamBoot.open().addListener((GenericFutureListener<Future<Http2StreamChannel>>) f -> {
-            if (!f.isSuccess()) {
-                LOG.log(Level.SEVERE, "[H2Proxy] failed to open HTTP/2 stream", f.cause());
-                bodyCopy.release();
-                sendError(clientChannel);
-                return;
-            }
-            Http2StreamChannel streamChannel = f.getNow();
-            Http2Headers h2Headers = buildHttp2Headers(forwardHeaders, upstreamPath, method);
-            streamChannel.write(new DefaultHttp2HeadersFrame(h2Headers, false));
-            int bodyBytes = bodyCopy.readableBytes();
-            streamChannel.writeAndFlush(new DefaultHttp2DataFrame(bodyCopy, true));
+        removeAggregationHandlers(clientChannel);
+        FullHttpRequest fullHttpRequest = (FullHttpRequest) httpRequest;
+        if (routeKind == RouteKind.CACHE_BIDI_PASSTHROUGH) {
+            cacheBidiContext(fullHttpRequest, pipeline);
+            ReferenceCountUtil.retain(fullHttpRequest);
+            pipeline.beforeRequest(clientChannel, (HttpRequest) fullHttpRequest);
+            return;
+        }
+        DownstreamRequest snapshot = snapshotRequest(fullHttpRequest, pipeline);
+        if (snapshot == null) {
+            sendPlainAsync(clientChannel,
+                    HttpResponseStatus.BAD_REQUEST,
+                    "Invalid cursor request",
+                    false);
+            return;
+        }
 
-            LOG.info("[H2Proxy] HTTP/2 stream opened, stream-id=" + streamChannel.stream().id() + " upstreamPath=" + upstreamPath + " scanAbort=" + scanAbort + " connectFrameAbort=" + connectFrameAbortScan + " bodyBytes=" + bodyBytes);
-        });
+        dl("CursorHttp2StreamAbortIntercept.beforeRequest", "REQUEST_ACCEPTED",
+                "{\"method\":\"" + snapshot.method
+                        + "\",\"path\":\"" + esc(snapshot.normalizedPath)
+                        + "\",\"upstreamUrl\":\"" + esc(snapshot.upstreamUrl)
+                        + "\",\"contentLength\":" + snapshot.body.length + "}");
+        if (snapshot.routeKind == RouteKind.BRIDGE_TO_UNIFIED_CHAT) {
+            String bodyRequestId = extractRequestIdFromRunSseBody(snapshot.body);
+            // #region agent log
+            dbg(debugRunId(snapshot.headers, bodyRequestId), "H3",
+                    "CursorHttp2StreamAbortIntercept.beforeRequest",
+                    "bridge_request_observed",
+                    "{\"path\":\"" + esc(snapshot.normalizedPath)
+                            + "\",\"accept\":\"" + esc(headerFirst(snapshot.headers, "accept"))
+                            + "\",\"contentType\":\"" + esc(headerFirst(snapshot.headers, "content-type"))
+                            + "\",\"bodyLen\":" + snapshot.body.length
+                            + ",\"requestId\":\"" + esc(bodyRequestId)
+                            + "\",\"sessionId\":\"" + esc(headerFirst(snapshot.headers, "x-session-id"))
+                            + "\"}");
+            // #endregion
+        }
+        printHeaders("[H2Proxy] Client Req Headers", snapshot.headers);
+        if (snapshot.body.length > 0) {
+            LOG.info("[H2Proxy] Client Req Body: " + snapshot.body.length
+                    + " bytes, hex=" + hexPrefix(snapshot.body, 120));
+        }
+
+        ClientResponseGate gate = ClientResponseGate.forChannel(clientChannel);
+        gate.enterOrEnqueue(() -> executeInterceptedRequest(clientChannel, snapshot));
     }
 
-    private Http2Headers buildHttp2Headers(HttpHeaders httpHeaders, String upstreamPath, HttpMethod method) {
-        Http2Headers h2h = new DefaultHttp2Headers();
-        h2h.method(method.name());
-        h2h.scheme("https");
-        h2h.authority(CURSOR_API_HOST);
-        h2h.path(upstreamPath);
-        for (Map.Entry<String, String> entry : httpHeaders) {
-            String name = entry.getKey().toLowerCase();
-            if (name.equals("host") || name.equals("connection") || name.equals("keep-alive") || name.equals("transfer-encoding") || name.equals("upgrade") || name.equals("proxy-connection") || name.equals("content-length")) {
-                continue;
-            }
-            h2h.add(name, entry.getValue());
-        }
-        return h2h;
-    }
+    // ================================================================
+    //  请求处理
+    // ================================================================
 
-    // ======================== Http2ConnectFrameAbortHandler（gRPC Connect 帧解压后 abort） ========================
-
-    /**
-     * Connect 协议结束帧：告诉客户端流正常结束（不是中断）。
-     * 格式：[0x02=flags(JSON,not-compressed)] [0x00000002=length] [0x7B 0x7D = "{}"]
-     */
-    private static final byte[] CONNECT_END_STREAM_FRAME = {0x02, 0x00, 0x00, 0x00, 0x02, 0x7B, 0x7D};
-
-    private class Http2ConnectFrameAbortHandler extends ChannelInboundHandlerAdapter {
-        private final Channel clientChannel;
-        private final byte[] needle;
-        /**
-         * 客户端原始 URI 是否 RunSSE/Agent（与上游是 Agent 透传还是 UnifiedChat 无关，用于下行格式对照日志）。
-         */
-        private final boolean clientStartedAsRunSsePath;
-        private final String clientAcceptHeader;
-        private byte[] tail;
-        private final AtomicBoolean aborted = new AtomicBoolean(false);
-        private boolean clientHeadersSent = false;
-        private final ConnectFrameStreamParser connectParser = new ConnectFrameStreamParser();
-        /**
-         * 本 handler 实例唯一 id，所有 NDJSON 行都带，便于串一条请求。
-         */
-        private final long streamLogId;
-        /**
-         * 每流最多打多少条 WIRE 明细，防止 while 循环无限刷屏。
-         */
-        private int wireDetailLogsEmitted;
-        private static final int MAX_WIRE_DETAIL_LOGS = 50;
-        /**
-         * 上游 HTTP/2 DATA 分片日志条数上限（大响应会拆很多片）。
-         */
-        private int h2DataChunkLogCount;
-        private static final int MAX_H2_DATA_LOGS = 40;
-        private int dbgFrameCount;
-        private long dbgBytesToClient;
-        private int dbgJsonErrLogged;
-        /**
-         * 在多个 msgType=0 帧上扫描可抽取正文（首帧常为 bubble/元数据，见 debug S3）。
-         */
-        private int s3ScanMsg0Ordinal;
-        private boolean s3FoundExtractableText;
-        private static final int S3_MAX_MSG0_SCAN = 80;
-        /**
-         * RunSSE 且上游 200 且客户端 Accept 含 event-stream：下行 {@code text/event-stream}；否则透传 Connect wire
-         */
-        private boolean sseDownstreamActive;
-        /**
-         * SSE 分支：msgType=0 抽取全文的前缀差分状态
-         */
-        private String lastSseMsg0FullText = "";
-        /**
-         * 客户端原始请求头（用于下行 Connect 二进制时覆盖上游 {@code text/event-stream}，与 connect-es 期望一致）。
-         */
-        private final HttpHeaders clientRequestHeaders;
-
-        Http2ConnectFrameAbortHandler(Channel clientChannel, byte[] needle, boolean clientStartedAsRunSsePath, String clientAcceptHeader, HttpHeaders clientRequestHeaders) {
-            this.clientChannel = clientChannel;
-            this.needle = needle;
-            this.clientStartedAsRunSsePath = clientStartedAsRunSsePath;
-            this.clientAcceptHeader = clientAcceptHeader;
-            this.clientRequestHeaders = clientRequestHeaders;
-            this.streamLogId = CONNECT_ABORT_HANDLER_LOG_SEQ.incrementAndGet();
-            CursorProxyDebugLog.line("STREAM_OPEN", "Http2ConnectFrameAbortHandler", "handler_created", "{\"streamLogId\":" + streamLogId + ",\"clientChId\":" + System.identityHashCode(clientChannel) + "}");
+    private void executeInterceptedRequest(Channel clientChannel, DownstreamRequest request) {
+        if (!clientChannel.isActive()) {
+            completeCurrentResponse(clientChannel);
+            return;
         }
 
-        private void runClient(Runnable r) {
-            runOnClient(clientChannel, r);
-        }
+        try {
+            Request upstreamRequest = buildUpstreamRequest(request);
+            dl("CursorHttp2StreamAbortIntercept.beforeUpstream", "UPSTREAM_REQUEST_PREPARED",
+                    "{\"upstreamUrl\":\"" + esc(request.upstreamUrl)
+                            + "\",\"bodyLen\":" + request.body.length
+                            + ",\"streaming\":" + request.abortAware
+                            + ",\"abortAware\":" + request.abortAware + "}");
 
-        @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            if (msg instanceof Http2HeadersFrame) {
-                Http2HeadersFrame hf = (Http2HeadersFrame) msg;
-                if (!clientHeadersSent) {
-                    CharSequence st = hf.headers().status();
-                    int statusCode = 200;
-                    try {
-                        if (st != null) {
-                            statusCode = Integer.parseInt(st.toString());
-                        }
-                    } catch (Exception ignored) {
-                    }
-                    boolean sseTextDownstream = shouldEmitSseTextDownstream(clientStartedAsRunSsePath, clientAcceptHeader);
-                    sseDownstreamActive = statusCode == 200 && sseTextDownstream;
-                    CharSequence ct = hf.headers().get(HttpHeaderNames.CONTENT_TYPE);
-                    CursorProxyDebugLog.line("S1", "Http2ConnectFrameAbortHandler", "upstream_first_headers", "{\"streamLogId\":" + streamLogId + ",\"status\":\"" + CursorProxyDebugLog.esc(st != null ? st.toString() : "") + "\",\"contentType\":\"" + CursorProxyDebugLog.esc(ct != null ? ct.toString() : "") + "\",\"endStream\":" + hf.isEndStream() + ",\"clientStartedAsRunSsePath\":" + clientStartedAsRunSsePath + ",\"clientAccept\":\"" + CursorProxyDebugLog.esc(clientAcceptHeader) + "\",\"sseTextDownstream\":" + sseTextDownstream + ",\"sseDownstreamActive\":" + sseDownstreamActive + "}");
-                    CursorProxyDebugLog.line("S1_H", "Http2ConnectFrameAbortHandler", "downstream_format", "{\"streamLogId\":" + streamLogId + ",\"mode\":\"" + (sseDownstreamActive ? "sse_connectMsg0_json_text_event_stream" : "connect_binary_chunked") + "\"}");
-                    final boolean endStream = hf.isEndStream();
-                    runClient(() -> {
-                        if (sseDownstreamActive) {
-                            writeSseStreamResponseHeaders(clientChannel, streamLogId);
-                        } else {
-                            writeClientConnectWireResponseHeaders(clientChannel, hf.headers(), clientRequestHeaders, streamLogId, clientStartedAsRunSsePath);
-                        }
-                        clientHeadersSent = true;
-                        if (endStream) {
-                            finishClient();
-                        }
-                    });
-                } else if (hf.isEndStream()) {
-                    runClient(this::finishClient);
-                }
-                return;
-            }
-            if (msg instanceof Http2DataFrame) {
-                Http2DataFrame df = (Http2DataFrame) msg;
-                boolean endStream = df.isEndStream();
-                if (aborted.get()) {
-                    df.release();
-                    return;
+            LOG.info("[H2Proxy] >>> Upstream: " + request.method + " " + request.upstreamUrl);
+            printOkHeaders("[H2Proxy] Upstream Req Headers", upstreamRequest.headers());
+
+            Call call = okHttpClient.newCall(upstreamRequest);
+            clientChannel.closeFuture().addListener(f -> call.cancel());
+            call.enqueue(new Callback() {
+                @Override
+                public void onResponse(Call call, Response response) {
+                    dl("OkHttp.onResponse", "UPSTREAM_RESPONSE",
+                            "{\"statusCode\":" + response.code()
+                                    + ",\"protocol\":\"" + response.protocol()
+                                    + "\",\"contentType\":\""
+                                    + esc(response.header("content-type")) + "\"}");
+                    handleUpstreamResponse(call, response, clientChannel, request);
                 }
 
-                ByteBuf buf = df.content();
-                int n = buf.readableBytes();
-                if (n > 0) {
-                    // #region agent log - 上游数据块详细日志
-                    byte[] bufCopy = new byte[Math.min(n, 64)];
-                    buf.getBytes(buf.readerIndex(), bufCopy);
-                    String bufHexPrefix = CursorProxyDebugLog.hexPrefix(bufCopy, bufCopy.length);
-                    if (h2DataChunkLogCount < MAX_H2_DATA_LOGS) {
-                        h2DataChunkLogCount++;
-                        CursorProxyDebugLog.line("H2_DATA", "Http2ConnectFrameAbortHandler", "upstream_data_chunk",
-                                "{\"streamLogId\":" + streamLogId + ",\"chunkBytes\":" + n
-                                        + ",\"endStream\":" + endStream + ",\"seq\":" + h2DataChunkLogCount
-                                        + ",\"bufHexPrefix\":\"" + bufHexPrefix + "\""
-                                        + ",\"parserRemainingBefore\":" + connectParser.remaining() + "}");
-                    } else if (h2DataChunkLogCount == MAX_H2_DATA_LOGS) {
-                        CursorProxyDebugLog.line("H2_DATA_CAP", "Http2ConnectFrameAbortHandler", "upstream_data_capped",
-                                "{\"streamLogId\":" + streamLogId + ",\"maxLogs\":" + MAX_H2_DATA_LOGS + "}");
-                        h2DataChunkLogCount++;
-                    }
-                    // #endregion
-                    connectParser.append(buf);
-                }
-                df.release();
-
-                try {
-                    processBufferedFrames(ctx);
-                } catch (IllegalStateException e) {
-                    LOG.log(Level.WARNING, "[H2Proxy] invalid Connect frame stream", e);
-                    abortWithError(ctx);
-                    return;
-                }
-
-                if (endStream) {
-                    if (!aborted.get() && connectParser.hasIncompleteTrailingData()) {
-                        LOG.warning("[H2Proxy] upstream endStream with incomplete Connect frame in buffer, len=" + connectParser.remaining());
-                    }
-                    runClient(this::finishClient);
-                }
-                return;
-            }
-            if (msg instanceof io.netty.util.ReferenceCounted) {
-                ((io.netty.util.ReferenceCounted) msg).release();
-            }
-        }
-
-        /**
-         * 按完整 Connect 帧处理：先解压 protobuf 帧载荷并做 needle 匹配，再决定是否转发整帧 wire 字节。
-         */
-        private void processBufferedFrames(ChannelHandlerContext ctx) {
-            while (true) {
-                byte[] wire = connectParser.pollWireFrame();
-                if (wire == null) {
-                    break;
-                }
-
-                ConnectFrameStreamParser.ParsedConnectFrame p = ConnectFrameStreamParser.ParsedConnectFrame.parse(wire);
-
-                // #region agent log - 详细帧解析日志
-                String wireHexPrefix = CursorProxyDebugLog.hexPrefix(wire, 32);
-                String payloadHexPrefix = p.payloadDecompressed == null ? "null" : CursorProxyDebugLog.hexPrefix(p.payloadDecompressed, 48);
-                CursorProxyDebugLog.line("FRAME", "Http2ConnectFrameAbortHandler", "frame_parsed",
-                        "{\"streamLogId\":" + streamLogId + ",\"msgType\":" + p.messageType
-                                + ",\"wireLen\":" + wire.length
-                                + ",\"wireHexPrefix\":\"" + wireHexPrefix + "\""
-                                + ",\"payloadDecompressedNull\":" + (p.payloadDecompressed == null)
-                                + ",\"payloadLen\":" + (p.payloadDecompressed == null ? -1 : p.payloadDecompressed.length)
-                                + ",\"payloadHexPrefix\":\"" + payloadHexPrefix + "\""
-                                + ",\"tailLen\":" + (tail == null ? 0 : tail.length)
-                                + ",\"aborted\":" + aborted.get() + "}");
-                // #endregion
-
-                // 如果已经 abort，不再处理新帧
-                if (aborted.get()) {
-                    break;
-                }
-
-                if (p.messageType == 0 && p.payloadDecompressed != null) {
-                    // #region agent log - 检查 abort 匹配前的状态
-                    boolean hasNeedle = CursorStreamAbortIntercept.containsAbortPattern(tail, p.payloadDecompressed, needle);
-                    String payloadTextPreview = new String(p.payloadDecompressed, StandardCharsets.UTF_8);
-                    if (payloadTextPreview.length() > 200) {
-                        payloadTextPreview = payloadTextPreview.substring(0, 200) + "...";
-                    }
-                    payloadTextPreview = payloadTextPreview.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n");
-                    CursorProxyDebugLog.line("MATCH_CHECK", "Http2ConnectFrameAbortHandler", "before_abort_check",
-                            "{\"streamLogId\":" + streamLogId + ",\"hasNeedle\":" + hasNeedle
-                                    + ",\"needleStr\":\"" + new String(needle, StandardCharsets.UTF_8).replace("\\", "\\\\").replace("\"", "\\\"") + "\""
-                                    + ",\"payloadTextPreview\":\"" + payloadTextPreview + "\"" + "}");
-                    // #endregion
-
-                    if (hasNeedle) {
-                        // 与 containsAbortPattern 一致：在 tail+payload 上定位，再映射到本帧 payload 字节偏移
-                        int glueIdx = CursorStreamAbortIntercept.findAbortNeedleStartIndex(tail, p.payloadDecompressed, needle);
-                        int pl = tail == null ? 0 : tail.length;
-                        int tokenByteIdx = -1;
-                        if (glueIdx >= 0) {
-                            tokenByteIdx = glueIdx < pl ? 0 : glueIdx - pl;
-                        }
-                        if (tokenByteIdx < 0) {
-                            tokenByteIdx = CursorStreamAbortIntercept.findAbortNeedleStartIndex(null, p.payloadDecompressed, needle);
-                        }
-                        // needle 前字节：在 tail+payload 上取 [0, glueIdx)，避免 token 落在 tail 重叠区时误用空 prefix
-                        byte[] prefixBeforeNeedle;
-                        if (glueIdx >= 0) {
-                            if (glueIdx <= pl) {
-                                prefixBeforeNeedle = (tail == null || glueIdx == 0)
-                                        ? new byte[0]
-                                        : Arrays.copyOfRange(tail, 0, glueIdx);
-                            } else {
-                                prefixBeforeNeedle = Arrays.copyOfRange(p.payloadDecompressed, 0, glueIdx - pl);
-                            }
-                        } else if (tokenByteIdx > 0) {
-                            prefixBeforeNeedle = Arrays.copyOfRange(p.payloadDecompressed, 0, tokenByteIdx);
-                        } else {
-                            prefixBeforeNeedle = new byte[0];
-                        }
-                        boolean lastRoleIsAssistant = ConnectProtoUtil.lastRoleBeforeNeedleIsAssistant(prefixBeforeNeedle);
-                        // #region agent log
-                        CursorProxyDebugLog.line("ABORT_ROLE", "Http2ConnectFrameAbortHandler", "role_gate",
-                                "{\"streamLogId\":" + streamLogId + ",\"glueIdx\":" + glueIdx + ",\"pl\":" + pl
-                                        + ",\"tokenByteIdx\":" + tokenByteIdx + ",\"lastRoleIsAssistant\":" + lastRoleIsAssistant + "}");
-                        // #endregion
-                        if (!lastRoleIsAssistant) {
-                            CursorProxyDebugLog.line("ABORT_FP", "Http2ConnectFrameAbortHandler", "skip_false_positive",
-                                    "{\"streamLogId\":" + streamLogId + ",\"reason\":\"needle_in_user_or_system_or_no_assistant_before_needle\"}");
-                        } else {
-                        aborted.set(true);
-                        LOG.info("[H2Proxy] abort token matched (decompressed protobuf payload), wireLen=" + wire.length);
-
-                        // #region agent log - 详细的 token 定位和截断过程
-                        CursorProxyDebugLog.line("ABORT_HIT", "Http2ConnectFrameAbortHandler", "token_match_details",
-                                "{\"streamLogId\":" + streamLogId + ",\"glueIdx\":" + glueIdx + ",\"pl\":" + pl
-                                        + ",\"tokenByteIdx\":" + tokenByteIdx
-                                        + ",\"payloadLen\":" + p.payloadDecompressed.length + ",\"wireLen\":" + wire.length
-                                        + ",\"sseDownstreamActive\":" + sseDownstreamActive + ",\"msgType\":" + p.messageType + "}");
-                        // #endregion
-
-                        if (tokenByteIdx > 0) {
-                            // 使用 removeAbortTokenFromWire - 它会正确处理嵌套protobuf字段长度
-                            byte[] newWire = ConnectProtoUtil.removeAbortTokenFromWire(wire, needle);
-                            
-                            // 获取截断后的payload用于日志（从wire解压）
-                            byte[] cleanPayload = newWire == null ? null : ConnectProtoUtil.extractPayloadFromWire(newWire);
-
-                            // 原始payload和截断后payload的详细对比
-                            String originalPayloadHex = CursorProxyDebugLog.hexPrefix(p.payloadDecompressed, 64);
-                            String cleanPayloadHex = cleanPayload == null ? "null" : CursorProxyDebugLog.hexPrefix(cleanPayload, 64);
-                            String newWireHex = newWire == null ? "null" : CursorProxyDebugLog.hexPrefix(newWire, 48);
-
-                            // token前后各50字节的上下文
-                            int ctxStart = Math.max(0, tokenByteIdx - 50);
-                            int ctxEnd = Math.min(p.payloadDecompressed.length, tokenByteIdx + 50 + needle.length);
-                            byte[] contextAroundToken = Arrays.copyOfRange(p.payloadDecompressed, ctxStart, ctxEnd);
-                            String contextHex = CursorProxyDebugLog.hexPrefix(contextAroundToken, contextAroundToken.length);
-                            String contextStr = new String(contextAroundToken, StandardCharsets.UTF_8)
-                                    .replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r");
-
-                            // 测试：提取完整payload和截断后payload的文本，对比可解析性
-                            String fullText = ConnectProtoUtil.extractTextFromResponseLenient(p.payloadDecompressed);
-                            String cleanPayloadText = cleanPayload == null ? null : ConnectProtoUtil.extractTextFromResponseLenient(cleanPayload);
-                            String fullTextPreview = fullText == null ? "null" : (fullText.length() > 100 ? fullText.substring(0, 100).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") : fullText.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n"));
-                            String cleanPayloadTextPreview = cleanPayloadText == null ? "null" : (cleanPayloadText.length() > 100 ? cleanPayloadText.substring(0, 100).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") : cleanPayloadText.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n"));
-
-                            // #region agent log
-                            CursorProxyDebugLog.line("ABORT_TRUNC", "Http2ConnectFrameAbortHandler", "truncate_result",
-                                    "{\"streamLogId\":" + streamLogId + ",\"originalPayloadLen\":" + p.payloadDecompressed.length
-                                            + ",\"originalPayloadHex\":\"" + originalPayloadHex + "\""
-                                            + ",\"tokenByteIdx\":" + tokenByteIdx 
-                                            + ",\"cleanPayloadLen\":" + (cleanPayload == null ? -1 : cleanPayload.length)
-                                            + ",\"cleanPayloadHex\":\"" + cleanPayloadHex + "\""
-                                            + ",\"contextAroundTokenHex\":\"" + contextHex + "\""
-                                            + ",\"contextStr\":\"" + contextStr + "\""
-                                            + ",\"fullTextExtractable\":" + (fullText != null) + ",\"fullTextPreview\":\"" + fullTextPreview + "\""
-                                            + ",\"cleanPayloadTextExtractable\":" + (cleanPayloadText != null) + ",\"cleanPayloadTextPreview\":\"" + cleanPayloadTextPreview + "\""
-                                            + ",\"newWireNull\":" + (newWire == null)
-                                            + ",\"newWireLen\":" + (newWire == null ? -1 : newWire.length)
-                                            + ",\"newWireHex\":\"" + newWireHex + "\"}");
-                            // #endregion
-
-                            runClient(() -> {
-                                ChannelFuture f;
-                                if (sseDownstreamActive) {
-                                    // SSE分支：转换为文本格式
-                                    String sseCleanText = new String(cleanPayload, StandardCharsets.UTF_8);
-                                    String json = SseDownstreamFormatter.connectMsg0Json(sseCleanText);
-                                    ByteBuf buf = SseDownstreamFormatter.sseDataLineUtf8(json);
-                                    // #region agent log
-                                    CursorProxyDebugLog.line("WRITE", "Http2ConnectFrameAbortHandler", "sse_write",
-                                            "{\"streamLogId\":" + streamLogId + ",\"jsonLen\":" + json.length()
-                                                    + ",\"bufLen\":" + buf.readableBytes() + "}");
-                                    // #endregion
-                                    f = clientChannel.writeAndFlush(new DefaultHttpContent(buf));
-                                } else {
-                                    // Connect二进制分支：发送清理后的帧
-                                    ByteBuf buf = Unpooled.wrappedBuffer(newWire);
-                                    // #region agent log
-                                    CursorProxyDebugLog.line("WRITE", "Http2ConnectFrameAbortHandler", "connect_write",
-                                            "{\"streamLogId\":" + streamLogId + ",\"newWireLen\":" + newWire.length
-                                                    + ",\"bufLen\":" + buf.readableBytes()
-                                                    + ",\"clientActive\":" + clientChannel.isActive()
-                                                    + ",\"clientWritable\":" + clientChannel.isWritable() + "}");
-                                    // #endregion
-                                    f = clientChannel.writeAndFlush(new DefaultHttpContent(buf));
-                                }
-                                f.addListener(done -> {
-                                    // #region agent log
-                                    Throwable cause = done.cause();
-                                    String errMsg = cause == null ? "" : cause.getClass().getSimpleName() + ":" + cause.getMessage();
-                                    CursorProxyDebugLog.line("ABORT_FLUSH", "Http2ConnectFrameAbortHandler", "first_frame_flush",
-                                            "{\"streamLogId\":" + streamLogId + ",\"success\":" + done.isSuccess()
-                                                    + ",\"clientActive\":" + clientChannel.isActive()
-                                                    + ",\"error\":\"" + errMsg.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}");
-                                    // #endregion
-                                });
-                            });
-                        } else {
-                            // needle 在 payload 起点或仅落在 tail：本帧不发正文（勿再下发含 token 的完整 wire）
-                            byte[] emptyWire = ConnectProtoUtil.recompressToConnectWire(wire, new byte[0]);
-                            final byte[] toSend = emptyWire != null ? emptyWire : wire;
-
-                            // #region agent log
-                            CursorProxyDebugLog.line("ABORT_EMPTY", "Http2ConnectFrameAbortHandler", "empty_payload",
-                                    "{\"streamLogId\":" + streamLogId + ",\"emptyWireNull\":" + (emptyWire == null)
-                                            + ",\"toSendLen\":" + toSend.length
-                                            + ",\"fallbackToRawWire\":" + (emptyWire == null) + "}");
-                            // #endregion
-
-                            runClient(() -> {
-                                ChannelFuture f;
-                                if (sseDownstreamActive) {
-                                    String json = SseDownstreamFormatter.connectMsg0Json("");
-                                    ByteBuf buf = SseDownstreamFormatter.sseDataLineUtf8(json);
-                                    f = clientChannel.writeAndFlush(new DefaultHttpContent(buf));
-                                } else {
-                                    ByteBuf buf = Unpooled.wrappedBuffer(toSend);
-                                    // #region agent log
-                                    CursorProxyDebugLog.line("WRITE", "Http2ConnectFrameAbortHandler", "empty_write",
-                                            "{\"streamLogId\":" + streamLogId + ",\"toSendLen\":" + toSend.length
-                                                    + ",\"clientActive\":" + clientChannel.isActive() + "}");
-                                    // #endregion
-                                    f = clientChannel.writeAndFlush(new DefaultHttpContent(buf));
-                                }
-                                f.addListener(done -> {
-                                    // #region agent log
-                                    CursorProxyDebugLog.line("ABORT_FLUSH", "Http2ConnectFrameAbortHandler", "empty_frame_flush",
-                                            "{\"streamLogId\":" + streamLogId + ",\"success\":" + done.isSuccess() + "}");
-                                    // #endregion
-                                });
-                            });
-                        }
-
-                        // 立即结束流 - 添加日志确认时序
-                        // #region agent log
-                        CursorProxyDebugLog.line("ABORT_TIMING", "Http2ConnectFrameAbortHandler", "calling_end_close",
-                                "{\"streamLogId\":" + streamLogId + ",\"note\":\"about_to_call_flushClientAbortEndAndClose\"}");
-                        // #endregion
-                        flushClientAbortEndAndClose(ctx);
+                @Override
+                public void onFailure(Call call, IOException e) {
+                    dl("OkHttp.onFailure", "UPSTREAM_FAILED",
+                            "{\"error\":\"" + esc(e.getClass().getSimpleName() + ": " + e.getMessage())
+                                    + "\",\"canceled\":" + call.isCanceled() + "}");
+                    if (call.isCanceled()) {
+                        completeCurrentResponse(clientChannel);
                         return;
-                        }
                     }
-
-                    tail = CursorStreamAbortIntercept.suffixForOverlap(p.payloadDecompressed, needle.length);
-                }
-
-                // ✅ 正常转发帧
-                // 测试：提取文本作为基线
-                String relayText = null;
-                if (p.messageType == 0 && p.payloadDecompressed != null) {
-                    relayText = ConnectProtoUtil.extractTextFromResponseLenient(p.payloadDecompressed);
-                }
-                String relayTextPreview = relayText == null ? "null" : (relayText.length() > 80 ? relayText.substring(0, 80).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") : relayText.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n"));
-
-                // #region agent log - 正常转发日志
-                CursorProxyDebugLog.line("RELAY", "Http2ConnectFrameAbortHandler", "normal_relay",
-                        "{\"streamLogId\":" + streamLogId + ",\"msgType\":" + p.messageType
-                                + ",\"wireLen\":" + wire.length
-                                + ",\"sseDownstreamActive\":" + sseDownstreamActive
-                                + ",\"clientActive\":" + clientChannel.isActive()
-                                + ",\"clientWritable\":" + clientChannel.isWritable()
-                                + ",\"relayTextExtractable\":" + (relayText != null)
-                                + ",\"relayTextPreview\":\"" + relayTextPreview + "\"}");
-                // #endregion
-                runClient(() -> {
-                    ChannelFuture f;
-                    if (sseDownstreamActive) {
-                        f = writeSseFromConnectFrame(p, wire, false);
-                    } else {
-                        ByteBuf buf = Unpooled.wrappedBuffer(wire);
-                        // #region agent log
-                        CursorProxyDebugLog.line("RELAY_WRITE", "Http2ConnectFrameAbortHandler", "writing_normal_frame",
-                                "{\"streamLogId\":" + streamLogId + ",\"wireLen\":" + wire.length
-                                        + ",\"bufLen\":" + buf.readableBytes()
-                                        + ",\"clientActive\":" + clientChannel.isActive()
-                                        + ",\"clientWritable\":" + clientChannel.isWritable() + "}");
-                        // #endregion
-                        f = clientChannel.writeAndFlush(new DefaultHttpContent(buf));
-                    }
-                    if (f != null) {
-                        f.addListener(done -> {
-                            // #region agent log
-                            Throwable cause = done.cause();
-                            String errMsg = cause == null ? "" : cause.getClass().getSimpleName() + ":" + cause.getMessage();
-                            CursorProxyDebugLog.line("RELAY_FLUSH", "Http2ConnectFrameAbortHandler", "normal_frame_flush",
-                                    "{\"streamLogId\":" + streamLogId + ",\"success\":" + done.isSuccess()
-                                            + ",\"clientActive\":" + clientChannel.isActive()
-                                            + ",\"error\":\"" + errMsg.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}");
-                            // #endregion
-                        });
-                    }
-                });
-            }
-        }
-
-        /**
-         * @param deferFlush true=仅 {@link Channel#write}，与随后 {@link #flushClientAbortEndAndClose(ChannelHandlerContext)} 一次 flush，避免多帧与尾包之间客户端先断开
-         * @return 最后一次写操作的 future；若本帧未向客户端写出内容（例如 msg0 且 delta 为空）则返回 null
-         */
-        private ChannelFuture writeSseFromConnectFrame(ConnectFrameStreamParser.ParsedConnectFrame p, byte[] wire, boolean deferFlush) {
-            if (p.messageType == 1 && p.payloadDecompressed != null) {
-                ByteBuf buf = SseDownstreamFormatter.connectMsg1JsonPayload(p.payloadDecompressed);
-                dbgBytesToClient += buf.readableBytes();
-                return deferFlush ? clientChannel.write(new DefaultHttpContent(buf)) : clientChannel.writeAndFlush(new DefaultHttpContent(buf));
-            }
-            if (p.messageType == 0 && p.payloadDecompressed != null) {
-                String t = ConnectProtoUtil.extractTextFromResponseLenient(p.payloadDecompressed);
-                if (t == null) {
-                    t = "";
-                }
-                String delta = computeMsg0TextDelta(lastSseMsg0FullText, t);
-                lastSseMsg0FullText = t;
-                if (delta.isEmpty()) {
-                    if (p.payloadDecompressed.length == 0) {
-                        return null;
-                    }
-                    if (dbgBytesToClient == 0) {
-                        String json = SseDownstreamFormatter.connectFallbackJson(p.messageType, wire);
-                        ByteBuf buf = SseDownstreamFormatter.sseDataLineUtf8(json);
-                        dbgBytesToClient += buf.readableBytes();
-                        return deferFlush ? clientChannel.write(new DefaultHttpContent(buf)) : clientChannel.writeAndFlush(new DefaultHttpContent(buf));
-                    }
-                    return null;
-                }
-                String json = SseDownstreamFormatter.connectMsg0Json(delta);
-                ByteBuf buf = SseDownstreamFormatter.sseDataLineUtf8(json);
-                dbgBytesToClient += buf.readableBytes();
-                return deferFlush ? clientChannel.write(new DefaultHttpContent(buf)) : clientChannel.writeAndFlush(new DefaultHttpContent(buf));
-            }
-            String json = SseDownstreamFormatter.connectFallbackJson(p.messageType, wire);
-            ByteBuf buf = SseDownstreamFormatter.sseDataLineUtf8(json);
-            dbgBytesToClient += buf.readableBytes();
-            return deferFlush ? clientChannel.write(new DefaultHttpContent(buf)) : clientChannel.writeAndFlush(new DefaultHttpContent(buf));
-        }
-
-        private String computeMsg0TextDelta(String previousFull, String currentFull) {
-            if (currentFull == null || currentFull.isEmpty()) {
-                return "";
-            }
-            if (previousFull == null || previousFull.isEmpty()) {
-                return currentFull;
-            }
-            if (currentFull.startsWith(previousFull)) {
-                return currentFull.substring(previousFull.length());
-            }
-            if (previousFull.startsWith(currentFull)) {
-                return "";
-            }
-            return currentFull;
-        }
-
-        /**
-         * 对上游 HTTP/2 流发 RST 并关闭该流；{@link #aborted} 须已由调用方置位。
-         */
-        private void rstUpstreamStream(ChannelHandlerContext ctx) {
-            CursorProxyDebugLog.line("RST_UPSTREAM", "rstUpstreamStream", "rst_cancel", "{\"streamLogId\":" + streamLogId + ",\"upstreamChId\":" + System.identityHashCode(ctx.channel()) + "}");
-            ctx.channel().writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.CANCEL)).addListener(ChannelFutureListener.CLOSE);
-        }
-
-        /**
-         * 向客户端写 Connect 结束帧（或 SSE 尾），再关闭与客户端的连接；在 {@link LastHttpContent} flush 完成后再对上游 RST，避免与下行竞态（H3）。
-         * abort 路径上命中帧的完整 body 应先 {@link Channel#write} 入队（不单独 flush），再写 END/SSE 尾，最后 {@code writeAndFlush(LastHttpContent)} 一次刷出；
-         * 仅当 LastHttpContent 刷出<strong>成功</strong>后才 {@link #rstUpstreamStream}。
-         *
-         * @param upstreamCtx 上游 HTTP/2 流 handler 上下文，供 {@link #rstUpstreamStream} 使用
-         */
-        private void flushClientAbortEndAndClose(ChannelHandlerContext upstreamCtx) {
-            // #region agent log
-            CursorProxyDebugLog.line("ABORT_TIMING", "Http2ConnectFrameAbortHandler", "scheduling_end_close",
-                    "{\"streamLogId\":" + streamLogId + ",\"clientActive\":" + clientChannel.isActive()
-                            + ",\"note\":\"scheduling_flushClientAbortEndAndCloseOnClient_via_runClient\"}");
-            // #endregion
-            runClient(() -> flushClientAbortEndAndCloseOnClient(upstreamCtx));
-        }
-
-        private void flushClientAbortEndAndCloseOnClient(ChannelHandlerContext upstreamCtx) {
-            // #region agent log
-            String connectEndFrameHex = CursorProxyDebugLog.hexPrefix(CONNECT_END_STREAM_FRAME, CONNECT_END_STREAM_FRAME.length);
-            CursorProxyDebugLog.line("ABORT_TIMING", "Http2ConnectFrameAbortHandler", "inside_end_close_lambda",
-                    "{\"streamLogId\":" + streamLogId + ",\"thread\":\"" + Thread.currentThread().getName().replace("\\", "\\\\").replace("\"", "\\\"") + "\"" + ",\"clientActive\":" + clientChannel.isActive() + "}");
-            CursorProxyDebugLog.line("ABORT_END", "Http2ConnectFrameAbortHandler", "sending_end_frames",
-                    "{\"streamLogId\":" + streamLogId + ",\"sseDownstreamActive\":" + sseDownstreamActive
-                            + ",\"clientActiveBefore\":" + clientChannel.isActive()
-                            + ",\"clientWritableBefore\":" + clientChannel.isWritable()
-                            + ",\"connectEndFrameHex\":\"" + connectEndFrameHex + "\"}");
-            // #endregion
-
-            if (sseDownstreamActive) {
-                // SSE 模式：发送 [DONE] 事件
-                ByteBuf done = SseDownstreamFormatter.sseDoneLine();
-                String doneStr = done.toString(StandardCharsets.UTF_8).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n");
-                // #region agent log
-                CursorProxyDebugLog.line("END_SSE", "Http2ConnectFrameAbortHandler", "sse_done_line",
-                        "{\"streamLogId\":" + streamLogId + ",\"doneLine\":\"" + doneStr + "\"}");
-                // #endregion
-                clientChannel.write(new DefaultHttpContent(done));
-
-                // 发送空行表示 SSE 流结束
-                ByteBuf emptyLine = Unpooled.copiedBuffer("\n", StandardCharsets.UTF_8);
-                clientChannel.write(new DefaultHttpContent(emptyLine));
-            } else {
-                // Connect 模式：发送结束帧
-                // #region agent log
-                CursorProxyDebugLog.line("END_CONNECT", "Http2ConnectFrameAbortHandler", "connect_end_frame",
-                        "{\"streamLogId\":" + streamLogId + ",\"endFrameLen\":" + CONNECT_END_STREAM_FRAME.length + "}");
-                // #endregion
-                clientChannel.write(new DefaultHttpContent(Unpooled.wrappedBuffer(CONNECT_END_STREAM_FRAME)));
-            }
-
-            ChannelFuture lastFut = clientChannel.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
-
-            lastFut.addListener(f -> {
-                // #region agent log
-                Throwable cause = f.cause();
-                String errMsg = cause == null ? "" : cause.getClass().getSimpleName() + ":" + cause.getMessage();
-                CursorProxyDebugLog.line("ABORT_LAST", "Http2ConnectFrameAbortHandler", "last_content_flush",
-                        "{\"streamLogId\":" + streamLogId + ",\"success\":" + f.isSuccess()
-                                + ",\"clientActive\":" + clientChannel.isActive()
-                                + ",\"error\":\"" + errMsg.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}");
-                // #endregion
-                if (f.isSuccess()) {
-                    // 等客户端完全收到数据后再 RST 上游
-                    rstUpstreamStream(upstreamCtx);
+                    LOG.log(Level.SEVERE, "[H2Proxy] Upstream request failed", e);
+                    sendPlainAsync(clientChannel,
+                            HttpResponseStatus.BAD_GATEWAY,
+                            "Upstream failed: " + e.getMessage(),
+                            request.keepAlive);
                 }
             });
-            lastFut.addListener(ChannelFutureListener.CLOSE);
-        }
-
-        private void abortWithError(ChannelHandlerContext ctx) {
-            CursorProxyDebugLog.line("ABORT_ERR", "Http2ConnectFrameAbortHandler", "abort_with_error", "{\"streamLogId\":" + streamLogId + ",\"clientActive\":" + clientChannel.isActive() + "}");
-            if (!aborted.getAndSet(true)) {
-                runClient(() -> clientChannel.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT).addListener(ChannelFutureListener.CLOSE));
-            }
-            ctx.close();
-        }
-
-        private void finishClient() {
-            if (aborted.get()) {
-                return;
-            }
-            CursorProxyDebugLog.line("FINISH", "Http2ConnectFrameAbortHandler", "normal_stream_end", "{\"streamLogId\":" + streamLogId + ",\"framesToClient\":" + dbgFrameCount + ",\"bytesToClient\":" + dbgBytesToClient + ",\"parserRemaining\":" + connectParser.remaining() + "}");
-            if (clientStartedAsRunSsePath && !s3FoundExtractableText && s3ScanMsg0Ordinal > 0) {
-                CursorProxyDebugLog.line("S3_MISS", "Http2ConnectFrameAbortHandler", "no_text_in_msg0_scan", "{\"msg0FramesScanned\":" + s3ScanMsg0Ordinal + ",\"note\":\"extractTextFromResponse null on all scanned msg0 payloads; " + "schema may differ or text in other fields\"}");
-            }
-            if (sseDownstreamActive && !aborted.get()) {
-                ByteBuf doneBuf = SseDownstreamFormatter.sseDoneLine();
-                dbgBytesToClient += doneBuf.readableBytes();
-                clientChannel.write(new DefaultHttpContent(doneBuf));
-            }
-            clientChannel.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT).addListener(ChannelFutureListener.CLOSE);
-        }
-
-        @Override
-        public void channelInactive(ChannelHandlerContext ctx) {
-            CursorProxyDebugLog.line("H2_UP_INACTIVE", "Http2ConnectFrameAbortHandler", "upstream_inactive", "{\"streamLogId\":" + streamLogId + ",\"aborted\":" + aborted.get() + "}");
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            LOG.log(Level.WARNING, "[H2Proxy] Chat/Connect frame stream error", cause);
-            CursorProxyDebugLog.line("EX_H2", "Http2ConnectFrameAbortHandler", "exception", "{\"streamLogId\":" + streamLogId + ",\"type\":\"" + CursorProxyDebugLog.esc(cause.getClass().getSimpleName()) + "\",\"msg\":\"" + CursorProxyDebugLog.esc(cause.getMessage()) + "\"}");
-            if (!aborted.getAndSet(true)) {
-                runClient(() -> clientChannel.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT).addListener(ChannelFutureListener.CLOSE));
-            }
-            ctx.close();
+        } catch (Exception e) {
+            LOG.log(Level.SEVERE, "[H2Proxy] Build upstream request failed", e);
+            sendPlainAsync(clientChannel,
+                    HttpResponseStatus.BAD_GATEWAY,
+                    "Proxy build failed: " + e.getMessage(),
+                    request.keepAlive);
         }
     }
 
-    /**
-     * RunSSE 等：上游响应可能为 SSE 文本或非 Connect 封装，按 HTTP/2 DATA 原始字节做 needle 匹配（先匹配再转发）。
-     */
-    private class Http2RawStreamAbortHandler extends ChannelInboundHandlerAdapter {
-        private final Channel clientChannel;
-        private final byte[] needle;
-        private final long rawStreamLogId;
-        private byte[] tail;
-        private final AtomicBoolean aborted = new AtomicBoolean(false);
-        private boolean clientHeadersSent = false;
+    private Request buildUpstreamRequest(DownstreamRequest request) {
+        HttpHeaders forwarded = buildForwardHeaders(request);
+        MediaType mediaType = parseMediaType(forwarded.get(HttpHeaderNames.CONTENT_TYPE));
+        RequestBody body = RequestBody.create(mediaType, buildUpstreamBody(request));
+        Request.Builder builder = new Request.Builder()
+                .url(request.upstreamUrl)
+                .method(request.method, body);
 
-        Http2RawStreamAbortHandler(Channel clientChannel, byte[] needle) {
-            this.clientChannel = clientChannel;
-            this.needle = needle;
-            this.rawStreamLogId = RAW_ABORT_HANDLER_LOG_SEQ.incrementAndGet();
-            CursorProxyDebugLog.line("RAW_OPEN", "Http2RawStreamAbortHandler", "handler_created", "{\"rawStreamLogId\":" + rawStreamLogId + "}");
+        for (Map.Entry<String, String> e : forwarded) {
+            builder.addHeader(e.getKey(), e.getValue());
         }
-
-        private void runClient(Runnable r) {
-            runOnClient(clientChannel, r);
-        }
-
-        @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            if (msg instanceof Http2HeadersFrame) {
-                Http2HeadersFrame hf = (Http2HeadersFrame) msg;
-                if (!clientHeadersSent) {
-                    runClient(() -> {
-                        writeClientResponseHeaders(clientChannel, hf.headers(), true);
-                        clientHeadersSent = true;
-                        if (hf.isEndStream()) {
-                            finishClient();
-                        }
-                    });
-                } else if (hf.isEndStream()) {
-                    runClient(this::finishClient);
-                }
-                return;
-            }
-            if (msg instanceof Http2DataFrame) {
-                Http2DataFrame df = (Http2DataFrame) msg;
-                boolean endStream = df.isEndStream();
-                if (aborted.get()) {
-                    df.release();
-                    return;
-                }
-
-                ByteBuf buf = df.content();
-                int n = buf.readableBytes();
-                if (n == 0) {
-                    df.release();
-                    if (endStream) {
-                        runClient(this::finishClient);
-                    }
-                    return;
-                }
-
-                byte[] chunk = new byte[n];
-                buf.getBytes(buf.readerIndex(), chunk);
-                df.release();
-
-                if (CursorStreamAbortIntercept.containsAbortPattern(tail, chunk, needle)) {
-                    int needleStart = CursorStreamAbortIntercept.findAbortNeedleStartIndex(tail, chunk, needle);
-                    int pl = tail == null ? 0 : tail.length;
-                    int keepLen = needleStart >= 0 ? needleStart - pl : 0;
-                    aborted.set(true);
-                    ctx.channel().writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.CANCEL)).addListener(ChannelFutureListener.CLOSE);
-                    CursorProxyDebugLog.line("RAW_ABORT", "Http2RawStreamAbortHandler", "raw_abort_match", "{\"rawStreamLogId\":" + rawStreamLogId + ",\"chunkLen\":" + chunk.length + ",\"keepLen\":" + keepLen + ",\"clientActive\":" + clientChannel.isActive() + ",\"partialHex\":\"" + CursorProxyDebugLog.hexPrefix(keepLen > 0 ? Arrays.copyOfRange(chunk, 0, keepLen) : new byte[0], 48) + "\"}");
-                    LOG.info("[H2Proxy] abort token matched (raw/SSE bytes), chunkLen=" + chunk.length);
-                    final int fl = keepLen;
-                    final byte[] ch = chunk;
-                    runClient(() -> {
-                        if (fl > 0) {
-                            byte[] partial = Arrays.copyOfRange(ch, 0, fl);
-                            clientChannel.write(new DefaultHttpContent(Unpooled.wrappedBuffer(partial)));
-                        }
-                        clientChannel.write(new DefaultHttpContent(Unpooled.wrappedBuffer(CONNECT_END_STREAM_FRAME)));
-                        ChannelFuture rawLast = clientChannel.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
-                        rawLast.addListener(f -> CursorProxyDebugLog.line("RAW_LAST_FLUSH", "Http2RawStreamAbortHandler", "raw_last_done", "{\"rawStreamLogId\":" + rawStreamLogId + ",\"success\":" + f.isSuccess() + ",\"clientActive\":" + clientChannel.isActive() + ",\"err\":\"" + CursorProxyDebugLog.esc(f.cause() == null ? "" : f.cause().getClass().getSimpleName() + ":" + f.cause().getMessage()) + "\"}"));
-                        rawLast.addListener(ChannelFutureListener.CLOSE);
-                    });
-                    return;
-                }
-                tail = CursorStreamAbortIntercept.suffixForOverlap(chunk, needle.length);
-                runClient(() -> {
-                    clientChannel.writeAndFlush(new DefaultHttpContent(Unpooled.wrappedBuffer(chunk)));
-                    if (endStream) {
-                        finishClient();
-                    }
-                });
-                return;
-            }
-            if (msg instanceof io.netty.util.ReferenceCounted) {
-                ((io.netty.util.ReferenceCounted) msg).release();
-            }
-        }
-
-        private void finishClient() {
-            if (aborted.get()) {
-                return;
-            }
-            clientChannel.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT).addListener(ChannelFutureListener.CLOSE);
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            LOG.log(Level.WARNING, "[H2Proxy] raw/SSE stream error", cause);
-            if (!aborted.getAndSet(true)) {
-                runClient(() -> clientChannel.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT).addListener(ChannelFutureListener.CLOSE));
-            }
-            ctx.close();
-        }
+        return builder.build();
     }
 
-    // ======================== Http2RelayHandler（非拦截路径，纯转发） ========================
+    // ================================================================
+    //  上游响应处理
+    // ================================================================
 
-    private static class Http2RelayHandler extends ChannelInboundHandlerAdapter {
-        private final Channel clientChannel;
-        private boolean clientHeadersSent = false;
-
-        Http2RelayHandler(Channel clientChannel) {
-            this.clientChannel = clientChannel;
-        }
-
-        private void runClient(Runnable r) {
-            runOnClient(clientChannel, r);
-        }
-
-        @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            if (msg instanceof Http2HeadersFrame) {
-                Http2HeadersFrame hf = (Http2HeadersFrame) msg;
-                if (!clientHeadersSent) {
-                    runClient(() -> {
-                        writeClientResponseHeaders(clientChannel, hf.headers(), false);
-                        clientHeadersSent = true;
-                        if (hf.isEndStream()) {
-                            finishClient();
-                        }
-                    });
-                } else if (hf.isEndStream()) {
-                    runClient(this::finishClient);
-                }
-                return;
-            }
-            if (msg instanceof Http2DataFrame) {
-                Http2DataFrame df = (Http2DataFrame) msg;
-                boolean endStream = df.isEndStream();
-                ByteBuf buf = df.content();
-                int n = buf.readableBytes();
-                if (n > 0) {
-                    byte[] data = new byte[n];
-                    buf.getBytes(buf.readerIndex(), data);
-                    runClient(() -> clientChannel.writeAndFlush(new DefaultHttpContent(Unpooled.wrappedBuffer(data))));
-                }
-                df.release();
-                if (endStream) {
-                    runClient(this::finishClient);
-                }
-                return;
-            }
-            if (msg instanceof io.netty.util.ReferenceCounted) ((io.netty.util.ReferenceCounted) msg).release();
-        }
-
-        private void finishClient() {
-            clientChannel.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT).addListener(ChannelFutureListener.CLOSE);
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            LOG.log(Level.WARNING, "[H2Proxy] relay stream error", cause);
-            runClient(() -> clientChannel.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT).addListener(ChannelFutureListener.CLOSE));
-            ctx.close();
-        }
-    }
-
-    /**
-     * RunSSE 下行：标准 SSE，由 {@link SseDownstreamFormatter} 写 data 行
-     */
-    private static void writeSseStreamResponseHeaders(Channel clientChannel, long streamLogId) {
-        DefaultHttpResponse resp = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
-        resp.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/event-stream; charset=utf-8");
-        resp.headers().set(HttpHeaderNames.CACHE_CONTROL, "no-cache, no-transform");
-        resp.headers().set("X-Accel-Buffering", "no");
-        resp.headers().set(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
-        resp.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
-        CursorProxyDebugLog.line("S1_SSE_HDR", "writeSseStreamResponseHeaders", "sse_headers", "{\"streamLogId\":" + streamLogId + "}");
-        clientChannel.writeAndFlush(resp);
-    }
-
-    /**
-     * 上游对 RunSSE 常返回 {@code Content-Type: text/event-stream}，但本路径实际向客户端写的是 gRPC Connect 二进制分块。
-     * 若透传该头，connect-es 会按 SSE 文本解析，与二进制帧不符，表现为无输出或异常重连。
-     * 应对齐<strong>客户端请求</strong>的 {@code Content-Type}（一般为 {@code application/connect+proto}）。
-     */
-    private static void writeClientConnectWireResponseHeaders(Channel clientChannel, Http2Headers upstream, HttpHeaders clientRequestHeaders, long streamLogId, boolean clientStartedAsRunSsePath) {
-        CharSequence st = upstream.status();
-        int statusCode = 200;
+    private void handleUpstreamResponse(Call call, Response response, Channel clientChannel,
+                                        DownstreamRequest request) {
         try {
-            if (st != null) {
-                statusCode = Integer.parseInt(st.toString());
+            if (!clientChannel.isActive()) {
+                response.close();
+                completeCurrentResponse(clientChannel);
+                return;
+            }
+
+            int status = response.code();
+            LOG.info("[H2Proxy] <<< Upstream Resp: " + status + " " + response.protocol());
+            printOkHeaders("[H2Proxy] Upstream Resp Headers", response.headers());
+
+            if (status != 200) {
+                sendErrorResponse(clientChannel, response, request.keepAlive);
+                return;
+            }
+
+            ResponseBody body = response.body();
+            DefaultHttpResponse downstreamHead = new DefaultHttpResponse(
+                    HttpVersion.HTTP_1_1, HttpResponseStatus.valueOf(status));
+            if (request.routeKind == RouteKind.BRIDGE_TO_UNIFIED_CHAT) {
+                initBridgedRunSseHeaders(request, downstreamHead.headers());
+                // #region agent log
+                dbg(debugRunId(request.headers, extractRequestIdFromRunSseBody(request.body)), "H3",
+                        "CursorHttp2StreamAbortIntercept.handleUpstreamResponse",
+                        "bridge_downstream_headers",
+                        "{\"upstreamContentType\":\"" + esc(response.header("content-type"))
+                                + "\",\"downstreamContentType\":\""
+                                + esc(downstreamHead.headers().get(HttpHeaderNames.CONTENT_TYPE))
+                                + "\",\"status\":" + status + "}");
+                // #endregion
+            } else {
+                copyDownstreamHeaders(response.headers(), downstreamHead.headers());
+            }
+            downstreamHead.headers().set(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
+            HttpUtil.setKeepAlive(downstreamHead, request.keepAlive);
+
+            clientChannel.writeAndFlush(downstreamHead);
+            LOG.info("[H2Proxy] >>> Client: HTTP/1.1 " + status + " chunked");
+
+            if (body == null) {
+                finishChunkedResponse(clientChannel, request.keepAlive);
+                response.close();
+                return;
+            }
+
+            if (request.routeKind == RouteKind.BRIDGE_TO_UNIFIED_CHAT) {
+                streamUnifiedChatAsAgentRunSse(call, body, clientChannel, request.keepAlive);
+            } else if (request.abortAware) {
+                streamWithAbortDetection(call, body, clientChannel, request.keepAlive);
+            } else {
+                streamRawBody(body, clientChannel, request.keepAlive);
+            }
+        } catch (Exception e) {
+            response.close();
+            LOG.log(Level.SEVERE, "[H2Proxy] handleUpstreamResponse error", e);
+            sendPlainAsync(clientChannel,
+                    HttpResponseStatus.BAD_GATEWAY,
+                    "Upstream handling failed: " + e.getMessage(),
+                    request.keepAlive);
+        }
+    }
+
+    private void sendErrorResponse(Channel clientChannel, Response response, boolean keepAlive)
+            throws IOException {
+        ResponseBody body = response.body();
+        byte[] errBytes = body != null ? body.bytes() : new byte[0];
+        FullHttpResponse fullResp = new DefaultFullHttpResponse(
+                HttpVersion.HTTP_1_1,
+                HttpResponseStatus.valueOf(response.code()),
+                Unpooled.wrappedBuffer(errBytes));
+        copyDownstreamHeaders(response.headers(), fullResp.headers());
+        fullResp.headers().set(HttpHeaderNames.CONTENT_LENGTH, errBytes.length);
+        HttpUtil.setKeepAlive(fullResp, keepAlive);
+        writeAndFinalize(clientChannel, fullResp, keepAlive);
+    }
+
+    // ================================================================
+    //  流式响应处理
+    // ================================================================
+
+    private void streamRawBody(ResponseBody body, Channel clientChannel, boolean keepAlive) {
+        try (InputStream is = body.byteStream()) {
+            byte[] buf = new byte[8192];
+            int n;
+            while (clientChannel.isActive() && (n = is.read(buf)) != -1) {
+                clientChannel.writeAndFlush(new DefaultHttpContent(
+                        Unpooled.copiedBuffer(buf, 0, n)));
+            }
+            finishChunkedResponse(clientChannel, keepAlive);
+        } catch (IOException e) {
+            LOG.log(Level.WARNING, "[H2Proxy] Raw stream read error", e);
+            finishChunkedResponse(clientChannel, keepAlive);
+        }
+    }
+
+    private void streamUnifiedChatAsAgentRunSse(Call call, ResponseBody body,
+                                                Channel clientChannel, boolean keepAlive) {
+        boolean trailerForwarded = false;
+        boolean turnEndedSent = false;
+        boolean firstFrameLogged = false;
+        int totalFrames = 0;
+        int dataFrames = 0;
+        int textFrames = 0;
+        try (InputStream is = body.byteStream();
+             DataInputStream dis = new DataInputStream(new BufferedInputStream(is))) {
+            int frameIdx = 0;
+            while (clientChannel.isActive()) {
+                int typeByte;
+                try {
+                    typeByte = dis.readUnsignedByte();
+                } catch (EOFException eof) {
+                    break;
+                }
+
+                int payloadLen = dis.readInt();
+                if (payloadLen < 0 || payloadLen > ConnectProtoUtil.MAX_CONNECT_PAYLOAD_LEN) {
+                    LOG.warning("[H2Proxy] Bad frame payload length: " + payloadLen);
+                    break;
+                }
+
+                byte[] payload = new byte[payloadLen];
+                dis.readFully(payload);
+                byte[] wire = buildWireFrame(typeByte, payload);
+                totalFrames++;
+
+                boolean compressed = (typeByte & 1) != 0;
+                int msgType = typeByte >> 1;
+                if (msgType == 0) {
+                    dataFrames++;
+                    byte[] decompressed = compressed
+                            ? ConnectProtoUtil.gzipDecompress(payload) : payload;
+                    if (decompressed == null) {
+                        frameIdx++;
+                        continue;
+                    }
+
+                    byte[] effectivePayload = decompressed;
+                    int needleIdx = ConnectProtoUtil.indexOfSubsequence(decompressed, abortTokenBytes);
+                    if (needleIdx >= 0) {
+                        byte[] prefix = Arrays.copyOfRange(decompressed, 0, needleIdx);
+                        boolean isAssistant =
+                                ConnectProtoUtil.lastRoleBeforeNeedleIsAssistant(prefix);
+                        if (isAssistant) {
+                            LOG.info("[H2Proxy] *** ABORT TOKEN matched at bridged frame#" + frameIdx + " ***");
+                            byte[] cleanedWire = ConnectProtoUtil.removeAbortTokenFromWire(
+                                    wire, abortTokenBytes);
+                            if (cleanedWire != null) {
+                                byte[] cleanedPayload = ConnectProtoUtil.extractPayloadFromWire(cleanedWire);
+                                if (cleanedPayload != null) {
+                                    effectivePayload = cleanedPayload;
+                                }
+                            }
+                            String text = ConnectProtoUtil.extractTextFromResponseLenient(effectivePayload);
+                            if (text != null && !text.isEmpty()) {
+                                writeConnectFrame(clientChannel, buildAgentTextDeltaFrame(text));
+                            }
+                            if (!turnEndedSent) {
+                                writeConnectFrame(clientChannel, buildAgentTurnEndedFrame());
+                                turnEndedSent = true;
+                            }
+                            call.cancel();
+                            finishChunkedResponse(clientChannel, keepAlive);
+                            return;
+                        }
+                    }
+
+                    String text = ConnectProtoUtil.extractTextFromResponseLenient(effectivePayload);
+                    if (text != null && !text.isEmpty()) {
+                        textFrames++;
+                        LOG.info("[H2Proxy] Bridged Frame#" + frameIdx
+                                + " text(" + text.length() + "): " + trunc(text, 300));
+                        if (!firstFrameLogged) {
+                            firstFrameLogged = true;
+                            byte[] clientWire = buildAgentTextDeltaFrame(text);
+                            // #region agent log
+                            dbg("bridge-stream", "H4",
+                                    "CursorHttp2StreamAbortIntercept.streamUnifiedChatAsAgentRunSse",
+                                    "bridge_first_text_frame",
+                                    "{\"frameIdx\":" + frameIdx
+                                            + ",\"compressed\":" + compressed
+                                            + ",\"upstreamTextPreview\":\"" + esc(oneLinePreview(text, 120))
+                                            + "\",\"clientWireLen\":" + (clientWire == null ? 0 : clientWire.length)
+                                            + "}");
+                            // #endregion
+                            writeConnectFrame(clientChannel, clientWire);
+                        } else {
+                            writeConnectFrame(clientChannel, buildAgentTextDeltaFrame(text));
+                        }
+                    }
+                } else if (msgType == 1) {
+                    if (!turnEndedSent) {
+                        writeConnectFrame(clientChannel, buildAgentTurnEndedFrame());
+                        turnEndedSent = true;
+                    }
+                    writeConnectFrame(clientChannel, wire);
+                    trailerForwarded = true;
+                }
+                frameIdx++;
+            }
+
+            // #region agent log
+            dbg("bridge-stream", "H4",
+                    "CursorHttp2StreamAbortIntercept.streamUnifiedChatAsAgentRunSse",
+                    "bridge_stream_summary",
+                    "{\"totalFrames\":" + totalFrames
+                            + ",\"dataFrames\":" + dataFrames
+                            + ",\"textFrames\":" + textFrames
+                            + ",\"trailerForwarded\":" + trailerForwarded
+                            + ",\"turnEndedSent\":" + turnEndedSent + "}");
+            // #endregion
+            if (!turnEndedSent) {
+                writeConnectFrame(clientChannel, buildAgentTurnEndedFrame());
+            }
+            if (!trailerForwarded) {
+                // Cursor 的 RunSSE 末尾通常还会跟一个 connect trailer；这里没有上游 trailer 时直接靠 HTTP 结束。
+            }
+            finishChunkedResponse(clientChannel, keepAlive);
+        } catch (IOException e) {
+            if (!call.isCanceled()) {
+                LOG.log(Level.WARNING, "[H2Proxy] Bridged stream read error", e);
+            }
+            // #region agent log
+            dbg("bridge-stream", "H4",
+                    "CursorHttp2StreamAbortIntercept.streamUnifiedChatAsAgentRunSse",
+                    "bridge_stream_ioexception",
+                    "{\"totalFrames\":" + totalFrames
+                            + ",\"dataFrames\":" + dataFrames
+                            + ",\"textFrames\":" + textFrames
+                            + ",\"error\":\"" + esc(e.getClass().getSimpleName() + ":" + e.getMessage()) + "\"}");
+            // #endregion
+            if (!turnEndedSent && clientChannel.isActive()) {
+                writeConnectFrame(clientChannel, buildAgentTurnEndedFrame());
+            }
+            finishChunkedResponse(clientChannel, keepAlive);
+        }
+    }
+
+    private void streamWithAbortDetection(Call call, ResponseBody body,
+                                          Channel clientChannel, boolean keepAlive) {
+        try (InputStream is = body.byteStream();
+             DataInputStream dis = new DataInputStream(new BufferedInputStream(is))) {
+            int frameIdx = 0;
+            while (clientChannel.isActive()) {
+                int typeByte;
+                try {
+                    typeByte = dis.readUnsignedByte();
+                } catch (EOFException eof) {
+                    break;
+                }
+
+                int payloadLen = dis.readInt();
+                if (payloadLen < 0 || payloadLen > ConnectProtoUtil.MAX_CONNECT_PAYLOAD_LEN) {
+                    LOG.warning("[H2Proxy] Bad frame payload length: " + payloadLen);
+                    break;
+                }
+
+                byte[] payload = new byte[payloadLen];
+                dis.readFully(payload);
+                byte[] wire = buildWireFrame(typeByte, payload);
+
+                boolean compressed = (typeByte & 1) != 0;
+                int msgType = typeByte >> 1;
+                if (msgType == 0) {
+                    byte[] decompressed = compressed
+                            ? ConnectProtoUtil.gzipDecompress(payload) : payload;
+                    if (decompressed != null) {
+                        String text = ConnectProtoUtil.extractTextFromResponseLenient(decompressed);
+                        if (text != null && !text.isEmpty()) {
+                            LOG.info("[H2Proxy] Frame#" + frameIdx
+                                    + " text(" + text.length() + "): " + trunc(text, 300));
+                        }
+                        int needleIdx = ConnectProtoUtil.indexOfSubsequence(
+                                decompressed, abortTokenBytes);
+                        if (needleIdx >= 0) {
+                            byte[] prefix = Arrays.copyOfRange(decompressed, 0, needleIdx);
+                            boolean isAssistant =
+                                    ConnectProtoUtil.lastRoleBeforeNeedleIsAssistant(prefix);
+                            if (isAssistant) {
+                                LOG.info("[H2Proxy] *** ABORT TOKEN matched at frame#" + frameIdx + " ***");
+                                byte[] cleaned = ConnectProtoUtil.removeAbortTokenFromWire(
+                                        wire, abortTokenBytes);
+                                if (cleaned != null && cleaned.length > 5) {
+                                    clientChannel.writeAndFlush(new DefaultHttpContent(
+                                            Unpooled.wrappedBuffer(cleaned)));
+                                    LOG.info("[H2Proxy] Forwarded cleaned frame (" + cleaned.length + " bytes)");
+                                }
+                                call.cancel();
+                                LOG.info("[H2Proxy] Upstream RST sent (call.cancel)");
+                                finishChunkedResponse(clientChannel, keepAlive);
+                                return;
+                            }
+                            LOG.info("[H2Proxy] Abort token in rule/thinking, ignoring");
+                        }
+                    }
+                }
+                clientChannel.writeAndFlush(new DefaultHttpContent(
+                        Unpooled.wrappedBuffer(wire)));
+                frameIdx++;
+            }
+            LOG.info("[H2Proxy] Stream complete, total frames=" + frameIdx);
+            finishChunkedResponse(clientChannel, keepAlive);
+        } catch (IOException e) {
+            if (!call.isCanceled()) {
+                LOG.log(Level.WARNING, "[H2Proxy] Stream read error", e);
+            }
+            finishChunkedResponse(clientChannel, keepAlive);
+        }
+    }
+
+    // ================================================================
+    //  请求识别 / 归一化
+    // ================================================================
+
+    private RouteKind classifyRoute(HttpRequest request, HttpProxyInterceptPipeline pipeline) {
+        if (request == null || !HttpMethod.POST.equals(request.method())) {
+            return RouteKind.PASSTHROUGH;
+        }
+        String hostFallback = pipeline.getRequestProto() == null
+                ? null : pipeline.getRequestProto().getHost();
+        String host = extractHost(request.headers(), hostFallback);
+        if (!isCursorApiHost(host)) {
+            return RouteKind.PASSTHROUGH;
+        }
+        String path = normalizePath(request.uri());
+        if (path.contains("BidiAppend")) {
+            return RouteKind.CACHE_BIDI_PASSTHROUGH;
+        }
+        if (path.contains("RunSSE")) {
+            return RouteKind.BRIDGE_TO_UNIFIED_CHAT;
+        }
+        if (path.contains("StreamUnifiedChat")) {
+            return RouteKind.PROXY_HTTP2_DIRECT;
+        }
+        return RouteKind.PASSTHROUGH;
+    }
+
+    private DownstreamRequest snapshotRequest(FullHttpRequest request,
+                                              HttpProxyInterceptPipeline pipeline) {
+        String normalizedPath = normalizePath(request.uri());
+        String hostFallback = pipeline.getRequestProto() == null
+                ? null : pipeline.getRequestProto().getHost();
+        String host = extractHost(request.headers(), hostFallback);
+        if (host == null || host.isEmpty()) {
+            LOG.warning("[H2Proxy] Missing host for intercepted request");
+            return null;
+        }
+        byte[] body = extractBody(request);
+        RouteKind routeKind = classifyRoute(request, pipeline);
+        String upstreamUrl = routeKind == RouteKind.BRIDGE_TO_UNIFIED_CHAT
+                ? UNIFIED_CHAT_UPSTREAM_URL
+                : "https://" + host + normalizedPath;
+        return new DownstreamRequest(
+                request.method().name(),
+                normalizedPath,
+                upstreamUrl,
+                copyHeaders(request.headers()),
+                body,
+                HttpUtil.isKeepAlive(request),
+                isAbortAwarePath(normalizedPath),
+                routeKind
+        );
+    }
+
+    private static String normalizePath(String uri) {
+        if (uri == null || uri.isEmpty()) {
+            return "/";
+        }
+        try {
+            URI parsed = URI.create(uri);
+            if (parsed.getScheme() != null) {
+                String path = parsed.getRawPath();
+                if (path == null || path.isEmpty()) {
+                    path = "/";
+                }
+                if (parsed.getRawQuery() != null && !parsed.getRawQuery().isEmpty()) {
+                    path += "?" + parsed.getRawQuery();
+                }
+                return path;
             }
         } catch (Exception ignored) {
         }
-        DefaultHttpResponse resp = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.valueOf(statusCode));
-        for (Map.Entry<CharSequence, CharSequence> entry : upstream) {
-            String name = entry.getKey().toString();
-            if (name.startsWith(":")) {
-                continue;
-            }
-            String lower = name.toLowerCase(Locale.ROOT);
-            // 下行体为已解压的 Connect 二进制分块，勿透传 hop-by-hop 或整段压缩声明，否则客户端会误解压/误解析
-            if ("content-type".equals(lower) || "content-length".equals(lower) || "content-encoding".equals(lower) || "transfer-encoding".equals(lower)) {
-                continue;
-            }
-            resp.headers().add(name, entry.getValue().toString());
-        }
-        String reqCt = clientRequestHeaders != null ? clientRequestHeaders.get(HttpHeaderNames.CONTENT_TYPE) : null;
-        if (reqCt == null || reqCt.isEmpty()) {
-            reqCt = "application/connect+proto";
-        }
-        resp.headers().set(HttpHeaderNames.CONTENT_TYPE, reqCt);
-        if (clientRequestHeaders != null) {
-            String cpv = clientRequestHeaders.get("connect-protocol-version");
-            if (cpv != null && !cpv.isEmpty()) {
-                resp.headers().set("connect-protocol-version", cpv);
-            }
-        }
-        resp.headers().set(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
-        resp.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
-        CursorProxyDebugLog.line("S1_CT", "writeClientConnectWireResponseHeaders", "override_content_type", "{\"streamLogId\":" + streamLogId + ",\"setContentType\":\"" + CursorProxyDebugLog.esc(reqCt) + "\",\"skippedContentEncodingAndTransferHeaders\":true}");
-        clientChannel.writeAndFlush(resp);
+        return uri.startsWith("/") ? uri : "/" + uri;
     }
 
-    /**
-     * 从 HTTP/2 响应头构建 HTTP/1.1 响应，透传所有头
-     */
-    private static void writeClientResponseHeaders(Channel clientChannel, Http2Headers h2h, boolean chunked) {
-        CharSequence status = h2h.status();
-        int statusCode = status != null ? Integer.parseInt(status.toString()) : 200;
-        DefaultHttpResponse resp = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.valueOf(statusCode));
-        for (Map.Entry<CharSequence, CharSequence> entry : h2h) {
-            String name = entry.getKey().toString();
-            if (name.startsWith(":")) continue;
-            resp.headers().add(name, entry.getValue().toString());
+    private static boolean isCursorApiHost(String host) {
+        if (host == null || host.isEmpty()) {
+            return false;
         }
-        if (chunked) {
-            resp.headers().set(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
-        }
-        clientChannel.writeAndFlush(resp);
+        String lower = host.toLowerCase(Locale.ROOT);
+        return lower.contains("cursor.sh") || lower.contains("cursorapi.com");
     }
 
-    // ======================== 上游 HTTP/2 连接管理 ========================
-
-    private Future<Channel> getOrCreateUpstreamConn() {
-        Channel existing = upstreamConnRef.get();
-        if (existing != null && existing.isActive()) {
-            Promise<Channel> p = upstreamEventLoopGroup.next().newPromise();
-            p.setSuccess(existing);
-            return p;
+    private static boolean isAbortAwarePath(String uri) {
+        if (uri == null) {
+            return false;
         }
-        synchronized (upstreamConnectLock) {
-            existing = upstreamConnRef.get();
-            if (existing != null && existing.isActive()) {
-                Promise<Channel> p = upstreamEventLoopGroup.next().newPromise();
-                p.setSuccess(existing);
-                return p;
-            }
-            Future<Channel> pending = pendingUpstreamConnect;
-            if (pending != null && !pending.isDone()) {
-                return pending;
-            }
-            Promise<Channel> resultPromise = connectUpstream();
-            pendingUpstreamConnect = resultPromise;
-            resultPromise.addListener((FutureListener<Channel>) future -> {
-                synchronized (upstreamConnectLock) {
-                    if (pendingUpstreamConnect == future) {
-                        pendingUpstreamConnect = null;
-                    }
+        return uri.contains("RunSSE") || uri.contains("StreamUnifiedChat");
+    }
+
+    // ================================================================
+    //  header / body 辅助
+    // ================================================================
+
+    private static HttpHeaders copyHeaders(HttpHeaders headers) {
+        io.netty.handler.codec.http.DefaultHttpHeaders copy =
+                new io.netty.handler.codec.http.DefaultHttpHeaders();
+        for (Map.Entry<String, String> e : headers) {
+            copy.add(e.getKey(), e.getValue());
+        }
+        return copy;
+    }
+
+    private static String extractHost(HttpHeaders headers, String fallbackHost) {
+        String host = headers.get(HttpHeaderNames.HOST);
+        if (host == null || host.isEmpty()) {
+            host = fallbackHost;
+        }
+        if (host == null) {
+            return null;
+        }
+        host = host.trim();
+        if (host.startsWith("http://") || host.startsWith("https://")) {
+            try {
+                URI uri = URI.create(host);
+                if (uri.getHost() != null) {
+                    host = uri.getHost() + (uri.getPort() > 0 ? ":" + uri.getPort() : "");
                 }
-            });
-            return resultPromise;
+            } catch (Exception ignored) {
+            }
+        }
+        return host;
+    }
+
+    private static void stripHopByHopRequestHeaders(HttpHeaders headers) {
+        headers.remove(HttpHeaderNames.HOST);
+        headers.remove(HttpHeaderNames.CONNECTION);
+        headers.remove(HttpHeaderNames.PROXY_CONNECTION);
+        headers.remove(HttpHeaderNames.KEEP_ALIVE);
+        headers.remove(HttpHeaderNames.TRANSFER_ENCODING);
+        headers.remove(HttpHeaderNames.CONTENT_LENGTH);
+        headers.remove(HttpHeaderNames.TE);
+        headers.remove(HttpHeaderNames.TRAILER);
+        headers.remove(HttpHeaderNames.UPGRADE);
+    }
+
+    private static void copyDownstreamHeaders(Headers from, HttpHeaders to) {
+        for (int i = 0; i < from.size(); i++) {
+            String name = from.name(i);
+            if (isHopByHopResponseHeader(name)) {
+                continue;
+            }
+            to.add(name, from.value(i));
         }
     }
 
-    private Promise<Channel> connectUpstream() {
-        Promise<Channel> resultPromise = upstreamEventLoopGroup.next().newPromise();
-        Bootstrap b = new Bootstrap();
-        b.group(upstreamEventLoopGroup).channel(NioSocketChannel.class).handler(new Http2UpstreamInitializer(upstreamSslCtx, resultPromise));
+    private static boolean isHopByHopResponseHeader(String name) {
+        if (name == null) {
+            return true;
+        }
+        String lower = name.toLowerCase(Locale.ROOT);
+        return "connection".equals(lower)
+                || "keep-alive".equals(lower)
+                || "proxy-connection".equals(lower)
+                || "transfer-encoding".equals(lower)
+                || "content-length".equals(lower)
+                || "te".equals(lower)
+                || "trailer".equals(lower)
+                || "upgrade".equals(lower);
+    }
 
-        b.connect(CURSOR_API_HOST, CURSOR_API_PORT).addListener((ChannelFutureListener) f -> {
-            if (!f.isSuccess()) {
-                resultPromise.tryFailure(f.cause());
+    private static MediaType parseMediaType(String raw) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            return MediaType.parse(raw);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static byte[] extractBody(FullHttpRequest request) {
+        if (!request.content().isReadable()) {
+            return new byte[0];
+        }
+        byte[] bytes = new byte[request.content().readableBytes()];
+        request.content().getBytes(request.content().readerIndex(), bytes);
+        return bytes;
+    }
+
+    private static byte[] buildWireFrame(int typeByte, byte[] payload) {
+        byte[] wire = new byte[5 + payload.length];
+        wire[0] = (byte) typeByte;
+        wire[1] = (byte) ((payload.length >> 24) & 0xFF);
+        wire[2] = (byte) ((payload.length >> 16) & 0xFF);
+        wire[3] = (byte) ((payload.length >> 8) & 0xFF);
+        wire[4] = (byte) (payload.length & 0xFF);
+        System.arraycopy(payload, 0, wire, 5, payload.length);
+        return wire;
+    }
+
+    private static void initBridgedRunSseHeaders(DownstreamRequest request, HttpHeaders headers) {
+        headers.set(HttpHeaderNames.CONTENT_TYPE, runSseContentType(request.headers));
+        headers.set("connect-protocol-version", "1");
+        headers.remove("connect-content-encoding");
+        headers.remove(HttpHeaderNames.CONTENT_ENCODING);
+        headers.set(HttpHeaderNames.CACHE_CONTROL, "no-cache");
+    }
+
+    private static String runSseContentType(HttpHeaders requestHeaders) {
+        return "application/connect+proto";
+    }
+
+    private static void writeConnectFrame(Channel clientChannel, byte[] wireFrame) {
+        if (wireFrame == null || wireFrame.length == 0 || !clientChannel.isActive()) {
+            return;
+        }
+        clientChannel.writeAndFlush(new DefaultHttpContent(Unpooled.wrappedBuffer(wireFrame)));
+    }
+
+    private HttpHeaders buildForwardHeaders(DownstreamRequest request) {
+        HttpHeaders forwarded;
+        if (request.routeKind == RouteKind.BRIDGE_TO_UNIFIED_CHAT) {
+            String bearerToken = CursorConnectUpstreamCodec.parseBearerToken(request.headers);
+            if (bearerToken == null || bearerToken.isEmpty()) {
+                throw new IllegalArgumentException("Missing Authorization Bearer");
+            }
+            forwarded = CursorConnectUpstreamCodec.hybridUpstreamHeadersForUnifiedChat(
+                    request.headers, bearerToken);
+        } else {
+            forwarded = copyHeaders(request.headers);
+            stripHopByHopRequestHeaders(forwarded);
+        }
+        if (headerModifier != null) {
+            headerModifier.accept(forwarded);
+        }
+        return forwarded;
+    }
+
+    private byte[] buildUpstreamBody(DownstreamRequest request) {
+        if (request.routeKind != RouteKind.BRIDGE_TO_UNIFIED_CHAT) {
+            return request.body;
+        }
+        try {
+            String cachedPrompt = findCachedPrompt(request);
+            String runId = debugRunId(request.headers, extractRequestIdFromRunSseBody(request.body));
+            String sessionModel = CursorSessionModelCache.getIfPresent(request.headers);
+            AgentRunSseModelResolver.ModelResolution resolution =
+                    AgentRunSseModelResolver.resolveDetail(request.headers, request.normalizedPath, request.body);
+            // #region agent log
+            dbg(runId, "H2",
+                    "CursorHttp2StreamAbortIntercept.buildUpstreamBody",
+                    "bridge_body_inputs",
+                    "{\"resolverModel\":\"" + esc(resolution.model)
+                            + "\",\"resolverSource\":\"" + esc(resolution.source)
+                            + "\",\"sessionCacheModel\":\"" + esc(sessionModel)
+                            + "\",\"cachedPromptLen\":" + (cachedPrompt == null ? 0 : cachedPrompt.length())
+                            + ",\"cachedPromptPreview\":\"" + esc(oneLinePreview(cachedPrompt, 120))
+                            + "\"}");
+            // #endregion
+            if ((cachedPrompt == null || cachedPrompt.trim().isEmpty())
+                    && isRequestIdOnlyRunSseBody(request.body)) {
+                // #region agent log
+                dbg(runId, "H1",
+                        "CursorHttp2StreamAbortIntercept.buildUpstreamBody",
+                        "reject_request_id_only_runsse",
+                        "{\"reason\":\"runsse_body_only_request_id_without_bidi_prompt\"}");
+                // #endregion
+                throw new IllegalStateException("RunSSE body only carries requestId; missing BidiAppend prompt");
+            }
+            if (cachedPrompt != null && !cachedPrompt.trim().isEmpty()) {
+                String model = chooseBridgedModel(sessionModel, resolution);
+                byte[] built = CursorConnectUpstreamCodec.buildFramedUnifiedChatBody(
+                        model, cachedPrompt);
+                // #region agent log
+                dbg(runId, "H2",
+                        "CursorHttp2StreamAbortIntercept.buildUpstreamBody",
+                        "bridge_body_output_bidi_cache",
+                        "{\"finalModel\":\"" + esc(model)
+                                + "\",\"promptSource\":\"bidi_cache"
+                                + "\",\"promptPreview\":\"" + esc(oneLinePreview(cachedPrompt, 120))
+                                + "\",\"outLen\":" + built.length + "}");
+                // #endregion
+                LOG.info("[H2Proxy] Body: RunSSE->UnifiedChat from cached Bidi prompt, len="
+                        + cachedPrompt.length());
+                return built;
+            }
+            ByteBuf rewritten = RunSseToUnifiedChatBodyConverter.maybeRewriteBodyForUnifiedChat(
+                    Unpooled.wrappedBuffer(request.body), request.normalizedPath, request.headers);
+            byte[] out = copyByteBuf(rewritten);
+            if (out.length > 0 && !Arrays.equals(out, request.body)) {
+                // #region agent log
+                dbg(runId, "H2",
+                        "CursorHttp2StreamAbortIntercept.buildUpstreamBody",
+                        "bridge_body_output_converter",
+                        "{\"finalModel\":\"" + esc(inferModelNameFromUnifiedBodyOrDefault(out))
+                                + "\",\"promptSource\":\"run_sse_converter"
+                                + "\",\"outLen\":" + out.length + "}");
+                // #endregion
+                LOG.info("[H2Proxy] Body: RunSSE->UnifiedChat fallback " + request.body.length
+                        + "->" + out.length + " bytes");
+                return out;
+            }
+            String textGuess = extractLongestUtf8Guess(request.body);
+            if (textGuess != null && !textGuess.trim().isEmpty()) {
+                byte[] built = CursorConnectUpstreamCodec.buildFramedUnifiedChatBody(
+                        CursorConnectUpstreamCodec.DEFAULT_MODEL, textGuess.trim());
+                // #region agent log
+                dbg(runId, "H2",
+                        "CursorHttp2StreamAbortIntercept.buildUpstreamBody",
+                        "bridge_body_output_raw_guess",
+                        "{\"finalModel\":\"" + esc(CursorConnectUpstreamCodec.DEFAULT_MODEL)
+                                + "\",\"promptSource\":\"raw_utf8_guess"
+                                + "\",\"promptPreview\":\"" + esc(oneLinePreview(textGuess, 120))
+                                + "\",\"outLen\":" + built.length + "}");
+                // #endregion
+                LOG.info("[H2Proxy] Body: built UnifiedChat from raw RunSSE utf8 guess len="
+                        + textGuess.trim().length());
+                return built;
+            }
+            throw new IllegalStateException("Cannot bridge RunSSE body to UnifiedChat");
+        } catch (Exception e) {
+            LOG.log(Level.WARNING, "[H2Proxy] RunSSE bridge body conversion failed", e);
+            throw new IllegalStateException("RunSSE bridge body conversion failed: " + e.getMessage(), e);
+        }
+    }
+
+    private String inferModelNameFromUnifiedBodyOrDefault(byte[] unifiedBody) {
+        byte[] payload = ConnectProtoUtil.extractPayloadFromWire(unifiedBody);
+        if (payload == null || payload.length == 0) {
+            return CursorConnectUpstreamCodec.DEFAULT_MODEL;
+        }
+        String model = findLikelyModel(payload);
+        return model != null ? model : CursorConnectUpstreamCodec.DEFAULT_MODEL;
+    }
+
+    private static String chooseBridgedModel(String sessionModel,
+                                             AgentRunSseModelResolver.ModelResolution resolution) {
+        if (sessionModel != null && !sessionModel.trim().isEmpty()) {
+            return sessionModel.trim();
+        }
+        if (resolution != null && resolution.model != null) {
+            String model = resolution.model.trim();
+            if (!model.isEmpty() && !"default".equalsIgnoreCase(model)) {
+                return model;
+            }
+        }
+        return CursorConnectUpstreamCodec.DEFAULT_MODEL;
+    }
+
+    private static String findLikelyModel(byte[] protobuf) {
+        Candidate best = new Candidate();
+        collectUtf8Candidates(protobuf, 0, 6, best, true);
+        return best.value;
+    }
+
+    private String findCachedPrompt(DownstreamRequest request) {
+        String requestId = extractRequestIdFromRunSseBody(request.body);
+        if (requestId != null) {
+            String cached = REQUEST_PROMPT_CACHE.get(requestId);
+            if (cached != null && !cached.trim().isEmpty()) {
+                return cached;
+            }
+        }
+        String sessionId = headerFirst(request.headers, "x-session-id");
+        if (sessionId != null) {
+            String cached = SESSION_PROMPT_CACHE.get(sessionId);
+            if (cached != null && !cached.trim().isEmpty()) {
+                return cached;
+            }
+        }
+        return null;
+    }
+
+    private void cacheBidiContext(FullHttpRequest request, HttpProxyInterceptPipeline pipeline) {
+        byte[] body = extractBody(request);
+        String normalizedPath = normalizePath(request.uri());
+        try {
+            CursorSessionModelCache.maybeIngestFromBidiBody(
+                    request.headers(), normalizedPath, Unpooled.wrappedBuffer(body));
+        } catch (Exception e) {
+            LOG.log(Level.FINE, "[H2Proxy] Cache Bidi model failed", e);
+        }
+        String sessionId = headerFirst(request.headers(), "x-session-id");
+        if (sessionId == null && pipeline.getRequestProto() != null) {
+            sessionId = pipeline.getRequestProto().getHost();
+        }
+        byte[] payload = decodeBidiOuterBody(body);
+        String outerRequestId = extractRequestIdFromDecodedBidiPayload(payload);
+        Long appendSeqNo = extractVarintField(payload, 3);
+        String hexData = extractStringField(payload, 1);
+        byte[] agentClientMsg = decodeHex(hexData);
+        String topMessage = null;
+        String structuredModel = null;
+        String structuredText = null;
+        String structuredRichText = null;
+        if (agentClientMsg != null && agentClientMsg.length > 0) {
+            byte[] runRequest = extractMessageField(agentClientMsg, 1);
+            byte[] conversationAction = extractMessageField(agentClientMsg, 4);
+            byte[] action = null;
+            if (runRequest != null) {
+                topMessage = "run_request";
+                action = extractMessageField(runRequest, 2);
+                byte[] modelDetails = extractMessageField(runRequest, 3);
+                byte[] requestedModel = extractMessageField(runRequest, 9);
+                structuredModel = firstNonBlank(
+                        extractStringField(requestedModel, 1),
+                        extractStringField(modelDetails, 1),
+                        extractStringField(modelDetails, 3));
+            } else if (conversationAction != null) {
+                topMessage = "conversation_action";
+                action = conversationAction;
+            } else {
+                topMessage = "other";
+            }
+            byte[] userMessageAction = extractMessageField(action, 1);
+            byte[] userMessage = extractMessageField(userMessageAction, 1);
+            structuredText = extractStringField(userMessage, 1);
+            structuredRichText = extractStringField(userMessage, 8);
+        }
+        if (sessionId != null && !sessionId.isEmpty()
+                && structuredModel != null && !structuredModel.isEmpty()) {
+            CursorSessionModelCache.put(sessionId, structuredModel);
+        }
+        // #region agent log
+        dbg(debugRunId(request.headers(), outerRequestId), "H5",
+                "CursorHttp2StreamAbortIntercept.cacheBidiContext",
+                "bidi_structured_probe",
+                "{\"outerRequestId\":\"" + esc(outerRequestId)
+                        + "\",\"appendSeqNo\":" + (appendSeqNo == null ? "null" : appendSeqNo.toString())
+                        + ",\"topMessage\":\"" + esc(topMessage)
+                        + "\",\"structuredText\":\"" + esc(oneLinePreview(structuredText, 120))
+                        + "\",\"structuredRichText\":\"" + esc(oneLinePreview(structuredRichText, 120))
+                        + "\",\"structuredRichTextPlain\":\""
+                        + esc(oneLinePreview(extractTextFromRichTextJson(structuredRichText), 120))
+                        + "\",\"structuredModel\":\"" + esc(structuredModel)
+                        + "\",\"sessionId\":\"" + esc(sessionId)
+                        + "\",\"sessionCacheModel\":\""
+                        + esc(CursorSessionModelCache.getIfPresent(request.headers()))
+                        + "\",\"agentUtf8Guess\":\"" + esc(oneLinePreview(extractLongestUtf8Guess(agentClientMsg), 120))
+                        + "\"}");
+        // #endregion
+        String prompt = extractPromptFromBidiBody(body);
+        if (prompt == null || prompt.trim().isEmpty()) {
+            return;
+        }
+        if (sessionId != null && !sessionId.isEmpty()) {
+            SESSION_PROMPT_CACHE.put(sessionId, prompt);
+        }
+        String requestId = outerRequestId;
+        if (requestId != null && !requestId.isEmpty()) {
+            REQUEST_PROMPT_CACHE.put(requestId, prompt);
+        }
+        // #region agent log
+        dbg(debugRunId(request.headers(), requestId), "H1",
+                "CursorHttp2StreamAbortIntercept.cacheBidiContext",
+                "bidi_cache_snapshot",
+                "{\"requestId\":\"" + esc(requestId)
+                        + "\",\"sessionId\":\"" + esc(sessionId)
+                        + "\",\"promptLen\":" + prompt.length()
+                        + ",\"promptPreview\":\"" + esc(oneLinePreview(prompt, 120))
+                        + "\",\"promptLooksUuid\":" + looksLikeUuid(prompt)
+                        + ",\"sessionCacheModel\":\""
+                        + esc(CursorSessionModelCache.getIfPresent(request.headers())) + "\"}");
+        // #endregion
+        LOG.info("[H2Proxy] Cached Bidi prompt len=" + prompt.length()
+                + (requestId != null ? ", requestId=" + trunc(requestId, 36) : "")
+                + (sessionId != null ? ", session=" + trunc(sessionId, 16) : ""));
+    }
+
+    private static String extractRequestIdFromRunSseBody(byte[] body) {
+        byte[] payload = ConnectProtoUtil.extractPayloadFromWire(body);
+        if (payload == null || payload.length == 0) {
+            return null;
+        }
+        return extractStringField(payload, 1);
+    }
+
+    private static String extractRequestIdFromBidiBody(byte[] body) {
+        return extractRequestIdFromDecodedBidiPayload(decodeBidiOuterBody(body));
+    }
+
+    private static String extractRequestIdFromDecodedBidiPayload(byte[] payload) {
+        if (payload == null || payload.length == 0) {
+            return null;
+        }
+        byte[] requestIdMsg = extractMessageField(payload, 2);
+        return extractStringField(requestIdMsg, 1);
+    }
+
+    private static byte[] decodeBidiOuterBody(byte[] body) {
+        if (body == null || body.length == 0) {
+            return null;
+        }
+        byte[] raw = body;
+        if (raw.length >= 2 && (raw[0] & 0xFF) == 0x1f && (raw[1] & 0xFF) == 0x8b) {
+            byte[] dec = ConnectProtoUtil.gzipDecompress(raw);
+            if (dec != null && dec.length > 0) {
+                raw = dec;
+            }
+        }
+        return raw;
+    }
+
+    private static String extractPromptFromBidiBody(byte[] body) {
+        byte[] payload = decodeBidiOuterBody(body);
+        if (payload == null || payload.length == 0) {
+            return null;
+        }
+        String hex = extractStringField(payload, 1);
+        if (hex == null || hex.isEmpty()) {
+            return null;
+        }
+        byte[] inner = decodeHex(hex);
+        if (inner == null || inner.length == 0) {
+            return null;
+        }
+        byte[] runRequest = extractMessageField(inner, 1);
+        byte[] conversationAction = extractMessageField(inner, 4);
+        byte[] action = runRequest != null ? extractMessageField(runRequest, 2) : conversationAction;
+        byte[] userMessageAction = extractMessageField(action, 1);
+        byte[] userMessage = extractMessageField(userMessageAction, 1);
+        String text = extractStringField(userMessage, 1);
+        if (text != null && !text.trim().isEmpty()) {
+            return text.trim();
+        }
+        String richText = extractStringField(userMessage, 8);
+        String prompt = extractTextFromRichTextJson(richText);
+        if (prompt != null && !prompt.trim().isEmpty()) {
+            return prompt.trim();
+        }
+        richText = findRichTextPayload(inner);
+        prompt = extractTextFromRichTextJson(richText);
+        if (prompt != null && !prompt.trim().isEmpty()) {
+            return prompt.trim();
+        }
+        Candidate best = new Candidate();
+        collectUtf8Candidates(inner, 0, 6, best, false);
+        return best.value == null ? null : best.value.trim();
+    }
+
+    private static String findRichTextPayload(byte[] protobuf) {
+        Candidate best = new Candidate();
+        collectRichTextCandidates(protobuf, 0, 6, best);
+        return best.value;
+    }
+
+    private static String extractTextFromRichTextJson(String richTextJson) {
+        if (richTextJson == null || richTextJson.isEmpty()) {
+            return null;
+        }
+        Matcher matcher = RICHTEXT_TEXT_PATTERN.matcher(richTextJson);
+        StringBuilder sb = new StringBuilder();
+        while (matcher.find()) {
+            String piece = jsonUnescape(matcher.group(1));
+            if (piece == null || piece.trim().isEmpty()) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append('\n');
+            }
+            sb.append(piece);
+        }
+        String result = sb.toString().trim();
+        return result.isEmpty() ? null : result;
+    }
+
+    private static String jsonUnescape(String s) {
+        if (s == null) {
+            return null;
+        }
+        StringBuilder out = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c != '\\' || i + 1 >= s.length()) {
+                out.append(c);
+                continue;
+            }
+            char n = s.charAt(++i);
+            switch (n) {
+                case '"':
+                    out.append('"');
+                    break;
+                case '\\':
+                    out.append('\\');
+                    break;
+                case '/':
+                    out.append('/');
+                    break;
+                case 'b':
+                    out.append('\b');
+                    break;
+                case 'f':
+                    out.append('\f');
+                    break;
+                case 'n':
+                    out.append('\n');
+                    break;
+                case 'r':
+                    out.append('\r');
+                    break;
+                case 't':
+                    out.append('\t');
+                    break;
+                case 'u':
+                    if (i + 4 < s.length()) {
+                        try {
+                            int cp = Integer.parseInt(s.substring(i + 1, i + 5), 16);
+                            out.append((char) cp);
+                            i += 4;
+                            break;
+                        } catch (NumberFormatException ignored) {
+                        }
+                    }
+                    out.append(n);
+                    break;
+                default:
+                    out.append(n);
+                    break;
+            }
+        }
+        return out.toString();
+    }
+
+    private static String extractStringField(byte[] protobuf, int wantedField) {
+        if (protobuf == null || protobuf.length == 0) {
+            return null;
+        }
+        int pos = 0;
+        while (pos < protobuf.length) {
+            int[] tag = readTag(protobuf, pos);
+            if (tag == null) {
+                return null;
+            }
+            int fieldNumber = tag[0];
+            int wireType = tag[1];
+            pos = tag[2];
+            if (wireType == 2) {
+                int[] len = readVarint(protobuf, pos);
+                if (len == null) {
+                    return null;
+                }
+                int size = len[0];
+                pos = len[1];
+                if (size < 0 || pos + size > protobuf.length) {
+                    return null;
+                }
+                if (fieldNumber == wantedField) {
+                    return safeUtf8(protobuf, pos, size);
+                }
+                pos += size;
+            } else {
+                pos = skipField(protobuf, pos, wireType);
+                if (pos < 0) {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static byte[] extractMessageField(byte[] protobuf, int wantedField) {
+        if (protobuf == null || protobuf.length == 0) {
+            return null;
+        }
+        int pos = 0;
+        while (pos < protobuf.length) {
+            int[] tag = readTag(protobuf, pos);
+            if (tag == null) {
+                return null;
+            }
+            int fieldNumber = tag[0];
+            int wireType = tag[1];
+            pos = tag[2];
+            if (wireType == 2) {
+                int[] len = readVarint(protobuf, pos);
+                if (len == null) {
+                    return null;
+                }
+                int size = len[0];
+                pos = len[1];
+                if (size < 0 || pos + size > protobuf.length) {
+                    return null;
+                }
+                if (fieldNumber == wantedField) {
+                    return Arrays.copyOfRange(protobuf, pos, pos + size);
+                }
+                pos += size;
+            } else {
+                pos = skipField(protobuf, pos, wireType);
+                if (pos < 0) {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static Long extractVarintField(byte[] protobuf, int wantedField) {
+        if (protobuf == null || protobuf.length == 0) {
+            return null;
+        }
+        int pos = 0;
+        while (pos < protobuf.length) {
+            int[] tag = readTag(protobuf, pos);
+            if (tag == null) {
+                return null;
+            }
+            int fieldNumber = tag[0];
+            int wireType = tag[1];
+            pos = tag[2];
+            if (wireType == 0) {
+                int[] val = readVarint(protobuf, pos);
+                if (val == null) {
+                    return null;
+                }
+                if (fieldNumber == wantedField) {
+                    return (long) val[0];
+                }
+                pos = val[1];
+            } else if (wireType == 2) {
+                int[] len = readVarint(protobuf, pos);
+                if (len == null) {
+                    return null;
+                }
+                int size = len[0];
+                pos = len[1] + size;
+                if (size < 0 || pos > protobuf.length) {
+                    return null;
+                }
+            } else {
+                pos = skipField(protobuf, pos, wireType);
+                if (pos < 0) {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static String extractNestedFirstStringField(byte[] protobuf, int wantedField) {
+        if (protobuf == null || protobuf.length == 0) {
+            return null;
+        }
+        int pos = 0;
+        while (pos < protobuf.length) {
+            int[] tag = readTag(protobuf, pos);
+            if (tag == null) {
+                return null;
+            }
+            int fieldNumber = tag[0];
+            int wireType = tag[1];
+            pos = tag[2];
+            if (wireType == 2) {
+                int[] len = readVarint(protobuf, pos);
+                if (len == null) {
+                    return null;
+                }
+                int size = len[0];
+                pos = len[1];
+                if (size < 0 || pos + size > protobuf.length) {
+                    return null;
+                }
+                if (fieldNumber == wantedField) {
+                    return extractStringField(Arrays.copyOfRange(protobuf, pos, pos + size), 1);
+                }
+                pos += size;
+            } else {
+                pos = skipField(protobuf, pos, wireType);
+                if (pos < 0) {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static byte[] decodeHex(String hex) {
+        if (hex == null) {
+            return null;
+        }
+        String raw = hex.trim();
+        if ((raw.length() & 1) != 0) {
+            return null;
+        }
+        byte[] out = new byte[raw.length() / 2];
+        for (int i = 0; i < raw.length(); i += 2) {
+            int hi = Character.digit(raw.charAt(i), 16);
+            int lo = Character.digit(raw.charAt(i + 1), 16);
+            if (hi < 0 || lo < 0) {
+                return null;
+            }
+            out[i / 2] = (byte) ((hi << 4) | lo);
+        }
+        return out;
+    }
+
+    private static void collectRichTextCandidates(byte[] data, int depth, int maxDepth, Candidate best) {
+        if (data == null || data.length == 0 || depth > maxDepth) {
+            return;
+        }
+        int pos = 0;
+        while (pos < data.length) {
+            int[] tag = readTag(data, pos);
+            if (tag == null) {
                 return;
             }
-            // 勿在此处 upstreamConnRef.set：TCP 已连上但 ALPN 未完成，pipeline 里还没有 Http2MultiplexHandler，
-            // 复用该 Channel 会导致 Http2StreamChannelBootstrap 报 IllegalStateException。
-        });
-        return resultPromise;
-    }
-
-    private class Http2UpstreamInitializer extends ChannelInitializer<SocketChannel> {
-        private final SslContext sslCtx;
-        private final Promise<Channel> connReadyPromise;
-
-        Http2UpstreamInitializer(SslContext sslCtx, Promise<Channel> connReadyPromise) {
-            this.sslCtx = sslCtx;
-            this.connReadyPromise = connReadyPromise;
-        }
-
-        @Override
-        protected void initChannel(SocketChannel ch) {
-            ch.pipeline().addLast(sslCtx.newHandler(ch.alloc(), CURSOR_API_HOST, CURSOR_API_PORT));
-            ch.pipeline().addLast(new ApplicationProtocolNegotiationHandler(ApplicationProtocolNames.HTTP_1_1) {
-                @Override
-                protected void configurePipeline(ChannelHandlerContext ctx, String protocol) {
-                    if (ApplicationProtocolNames.HTTP_2.equals(protocol)) {
-                        ctx.pipeline().addLast(Http2FrameCodecBuilder.forClient().initialSettings(Http2Settings.defaultSettings()).build());
-                        ctx.pipeline().addLast(new Http2MultiplexHandler(new ChannelInboundHandlerAdapter()));
-                        LOG.info("[H2Proxy] HTTP/2 negotiated via ALPN, multiplex ready");
-                        Channel c = ctx.channel();
-                        upstreamConnRef.set(c);
-                        c.closeFuture().addListener(cf -> upstreamConnRef.compareAndSet(c, null));
-                        connReadyPromise.trySuccess(c);
-                    } else {
-                        connReadyPromise.tryFailure(new IllegalStateException("Expected h2 but got: " + protocol));
-                        ctx.close();
+            int wireType = tag[1];
+            pos = tag[2];
+            if (wireType == 2) {
+                int[] len = readVarint(data, pos);
+                if (len == null) {
+                    return;
+                }
+                int size = len[0];
+                pos = len[1];
+                if (size < 0 || pos + size > data.length) {
+                    return;
+                }
+                byte[] chunk = Arrays.copyOfRange(data, pos, pos + size);
+                String s = safeUtf8(chunk, 0, chunk.length);
+                if (s != null && s.contains("\"root\"") && s.contains("\"children\"")
+                        && s.contains("\"text\"")) {
+                    int score = 200 + s.length();
+                    if (score > best.score) {
+                        best.value = s;
+                        best.score = score;
                     }
                 }
-
-                @Override
-                protected void handshakeFailure(ChannelHandlerContext ctx, Throwable cause) {
-                    connReadyPromise.tryFailure(cause);
-                    ctx.close();
+                collectRichTextCandidates(chunk, depth + 1, maxDepth, best);
+                pos += size;
+            } else {
+                pos = skipField(data, pos, wireType);
+                if (pos < 0) {
+                    return;
                 }
-            });
+            }
         }
     }
 
-    // ======================== SSL ========================
-
-    private static SslContext buildUpstreamSslContext() throws SSLException {
-        return SslContextBuilder.forClient().applicationProtocolConfig(new ApplicationProtocolConfig(ApplicationProtocolConfig.Protocol.ALPN, ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE, ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT, ApplicationProtocolNames.HTTP_2)).build();
+    private static void collectUtf8Candidates(byte[] data, int depth, int maxDepth,
+                                              Candidate best, boolean modelMode) {
+        if (data == null || data.length == 0 || depth > maxDepth) {
+            return;
+        }
+        int pos = 0;
+        while (pos < data.length) {
+            int[] tag = readTag(data, pos);
+            if (tag == null) {
+                return;
+            }
+            int wireType = tag[1];
+            pos = tag[2];
+            if (wireType == 2) {
+                int[] len = readVarint(data, pos);
+                if (len == null) {
+                    return;
+                }
+                int size = len[0];
+                pos = len[1];
+                if (size < 0 || pos + size > data.length) {
+                    return;
+                }
+                byte[] chunk = Arrays.copyOfRange(data, pos, pos + size);
+                String s = safeUtf8(chunk, 0, chunk.length);
+                if (s != null) {
+                    int score = modelMode ? scoreModelCandidate(s) : scorePromptCandidate(s);
+                    if (score > best.score) {
+                        best.value = s;
+                        best.score = score;
+                    }
+                }
+                collectUtf8Candidates(chunk, depth + 1, maxDepth, best, modelMode);
+                pos += size;
+            } else {
+                pos = skipField(data, pos, wireType);
+                if (pos < 0) {
+                    return;
+                }
+            }
+        }
     }
 
-    private SslContext buildMitmSslContext(String host) {
+    private static int scoreModelCandidate(String text) {
+        String t = text == null ? "" : text.trim();
+        if (t.length() < 3 || t.length() > 120) {
+            return 0;
+        }
+        String low = t.toLowerCase(Locale.ROOT);
+        if (low.contains("claude") || low.contains("gpt")
+                || low.contains("gemini") || low.contains("grok")
+                || low.contains("deepseek")) {
+            return 100 + t.length();
+        }
+        return 0;
+    }
+
+    private static int scorePromptCandidate(String text) {
+        String t = text == null ? "" : text.trim();
+        if (t.length() < 2 || t.length() > 4000) {
+            return 0;
+        }
+        if (looksLikeUuid(t) || looksLikeHexBlob(t) || looksLikePath(t)) {
+            return 0;
+        }
+        int score = Math.min(80, t.length() / 6);
+        if (containsCjk(t)) {
+            score += 80;
+        }
+        if (t.indexOf(' ') >= 0) {
+            score += 20;
+        }
+        if (t.indexOf('\n') >= 0) {
+            score += 10;
+        }
+        if (t.startsWith("{") && t.endsWith("}")) {
+            score -= 30;
+        }
+        if (t.contains("<user_query>")) {
+            score += 120;
+        }
+        if (t.length() > 2048) {
+            score -= 40;
+        }
+        return score;
+    }
+
+    private static boolean looksLikeUuid(String t) {
+        return t.matches("(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+    }
+
+    private static boolean looksLikeHexBlob(String t) {
+        return t.length() >= 32 && t.matches("(?i)^[0-9a-f]+$");
+    }
+
+    private static boolean looksLikePath(String t) {
+        int slash = 0;
+        for (int i = 0; i < t.length(); i++) {
+            char c = t.charAt(i);
+            if (c == '\\' || c == '/') {
+                slash++;
+            }
+        }
+        return slash >= 3;
+    }
+
+    private static boolean containsCjk(String t) {
+        for (int i = 0; i < t.length(); i++) {
+            char c = t.charAt(i);
+            if (c >= 0x4E00 && c <= 0x9FFF) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String safeUtf8(byte[] data, int off, int len) {
+        if (data == null || len <= 0 || off < 0 || off + len > data.length) {
+            return null;
+        }
+        String s = new String(data, off, len, StandardCharsets.UTF_8);
+        return s.indexOf('\uFFFD') >= 0 ? null : s;
+    }
+
+    private static int[] readTag(byte[] data, int pos) {
+        int[] varint = readVarint(data, pos);
+        if (varint == null) {
+            return null;
+        }
+        int tag = varint[0];
+        return new int[] {tag >>> 3, tag & 0x07, varint[1]};
+    }
+
+    private static int[] readVarint(byte[] data, int pos) {
+        int result = 0;
+        int shift = 0;
+        while (pos < data.length && shift < 35) {
+            int b = data[pos++] & 0xFF;
+            result |= (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) {
+                return new int[] {result, pos};
+            }
+            shift += 7;
+        }
+        return null;
+    }
+
+    private static int skipField(byte[] data, int pos, int wireType) {
+        switch (wireType) {
+            case 0:
+                int[] varint = readVarint(data, pos);
+                return varint == null ? -1 : varint[1];
+            case 1:
+                return pos + 8 <= data.length ? pos + 8 : -1;
+            case 2:
+                int[] len = readVarint(data, pos);
+                if (len == null) {
+                    return -1;
+                }
+                int size = len[0];
+                int end = len[1] + size;
+                return size >= 0 && end <= data.length ? end : -1;
+            case 5:
+                return pos + 4 <= data.length ? pos + 4 : -1;
+            default:
+                return -1;
+        }
+    }
+
+    private static byte[] copyByteBuf(ByteBuf buf) {
+        byte[] out = new byte[buf.readableBytes()];
+        buf.getBytes(buf.readerIndex(), out);
+        return out;
+    }
+
+    private static byte[] buildAgentTextDeltaFrame(String text) {
         try {
-            X509Certificate cert = CertUtil.genCert(mitmConfig.getIssuer(), mitmConfig.getCaPriKey(), mitmConfig.getCaNotBefore(), mitmConfig.getCaNotAfter(), mitmConfig.getServerPubKey(), host);
-            return SslContextBuilder.forServer(mitmConfig.getServerPriKey(), cert).build();
-        } catch (Exception e) {
-            throw new RuntimeException("[H2Proxy] MITM SSL build failed for " + host, e);
+            byte[] textDelta = encodeLengthDelimitedField(1, utf8(text == null ? "" : text));
+            byte[] interactionUpdate = encodeLengthDelimitedField(1, textDelta);
+            byte[] agentServerMsg = encodeLengthDelimitedField(1, interactionUpdate);
+            return buildWireFrame(0, agentServerMsg);
+        } catch (IOException e) {
+            return null;
         }
     }
 
-    private static HttpProxyServerConfig loadMitmConfig() throws Exception {
-        ClassLoader cl = Thread.currentThread().getContextClassLoader();
-        X509Certificate caCert = CertUtil.loadCert(cl.getResourceAsStream("ca.crt"));
-        PrivateKey caPriKey = CertUtil.loadPriKey(cl.getResourceAsStream("ca_private.der"));
-        KeyPair kp = CertUtil.genKeyPair();
-        HttpProxyServerConfig cfg = new HttpProxyServerConfig();
-        cfg.setIssuer(CertUtil.getSubject(caCert));
-        cfg.setCaNotBefore(caCert.getNotBefore());
-        cfg.setCaNotAfter(caCert.getNotAfter());
-        cfg.setCaPriKey(caPriKey);
-        cfg.setServerPriKey(kp.getPrivate());
-        cfg.setServerPubKey(kp.getPublic());
-        return cfg;
+    private static byte[] buildAgentTurnEndedFrame() {
+        try {
+            byte[] interactionUpdate = encodeLengthDelimitedField(14, new byte[0]);
+            byte[] agentServerMsg = encodeLengthDelimitedField(1, interactionUpdate);
+            return buildWireFrame(0, agentServerMsg);
+        } catch (IOException e) {
+            return null;
+        }
     }
 
-    // ======================== 工具方法 ========================
+    private static byte[] utf8(String s) {
+        return s == null ? new byte[0] : s.getBytes(StandardCharsets.UTF_8);
+    }
 
-    private static void logRequestHeaders(FullHttpRequest req) {
-        StringBuilder sb = new StringBuilder("[H2Proxy] ").append(req.method()).append(' ').append(req.uri());
-        String host = req.headers().get(HttpHeaderNames.HOST);
-        if (host != null) sb.append(" (host=").append(host).append(')');
+    private static byte[] encodeLengthDelimitedField(int fieldNumber, byte[] payload) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(payload.length + 8);
+        writeVarint(out, (fieldNumber << 3) | 2);
+        writeVarint(out, payload.length);
+        out.write(payload);
+        return out.toByteArray();
+    }
+
+    private static void writeVarint(ByteArrayOutputStream out, int value) {
+        int v = value;
+        while (true) {
+            int b = v & 0x7F;
+            v >>>= 7;
+            if (v == 0) {
+                out.write(b);
+                return;
+            }
+            out.write(b | 0x80);
+        }
+    }
+
+    private static String headerFirst(HttpHeaders headers, String name) {
+        String value = headers.get(name);
+        if (value != null && !value.isEmpty()) {
+            return value;
+        }
+        for (String headerName : headers.names()) {
+            if (headerName != null && headerName.equalsIgnoreCase(name)) {
+                return headers.get(headerName);
+            }
+        }
+        return null;
+    }
+
+    private static String extractLongestUtf8Guess(byte[] data) {
+        if (data == null || data.length == 0) {
+            return null;
+        }
+        String s = new String(data, StandardCharsets.UTF_8);
+        StringBuilder cur = new StringBuilder();
+        String best = "";
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (Character.isISOControl(c) && c != '\n' && c != '\r' && c != '\t') {
+                if (cur.length() > best.length()) {
+                    best = cur.toString();
+                }
+                cur.setLength(0);
+            } else if (c != '\uFFFD') {
+                cur.append(c);
+            }
+        }
+        if (cur.length() > best.length()) {
+            best = cur.toString();
+        }
+        best = best.trim();
+        return best.isEmpty() ? null : best;
+    }
+
+    private static boolean isRequestIdOnlyRunSseBody(byte[] body) {
+        byte[] payload = ConnectProtoUtil.extractPayloadFromWire(body);
+        if (payload == null || payload.length == 0) {
+            return false;
+        }
+        String requestId = extractRequestIdFromRunSseBody(body);
+        if (requestId == null || requestId.isEmpty()) {
+            return false;
+        }
+        String field1 = extractStringField(payload, 1);
+        if (!requestId.equals(field1)) {
+            return false;
+        }
+        return payload.length <= requestId.length() + 4;
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null) {
+            return null;
+        }
+        for (String value : values) {
+            if (value != null && !value.trim().isEmpty()) {
+                return value.trim();
+            }
+        }
+        return null;
+    }
+
+    // ================================================================
+    //  pipeline / response 生命周期
+    // ================================================================
+
+    private void ensureFullRequestAggregation(Channel clientChannel,
+                                              HttpProxyInterceptPipeline pipeline) {
+        pipeline.resetBeforeHead();
+        if (clientChannel.pipeline().get(AGGREGATOR_NAME) == null) {
+            clientChannel.pipeline().addAfter("httpCodec", AGGREGATOR_NAME,
+                    new HttpObjectAggregator(MAX_FULL_REQUEST_BYTES));
+        }
+    }
+
+    private void removeAggregationHandlers(Channel clientChannel) {
+        if (clientChannel.pipeline().get(AGGREGATOR_NAME) != null) {
+            clientChannel.pipeline().remove(AGGREGATOR_NAME);
+        }
+    }
+
+    private void finishChunkedResponse(Channel clientChannel, boolean keepAlive) {
+        if (!clientChannel.isActive()) {
+            completeCurrentResponse(clientChannel);
+            return;
+        }
+        ChannelFuture future = clientChannel.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
+        future.addListener(f -> finalizeResponse(clientChannel, keepAlive));
+    }
+
+    private void writeAndFinalize(Channel clientChannel,
+                                  FullHttpResponse response, boolean keepAlive) {
+        if (!clientChannel.isActive()) {
+            completeCurrentResponse(clientChannel);
+            return;
+        }
+        clientChannel.writeAndFlush(response)
+                .addListener(f -> finalizeResponse(clientChannel, keepAlive));
+    }
+
+    private void finalizeResponse(Channel clientChannel, boolean keepAlive) {
+        completeCurrentResponse(clientChannel);
+        if (!keepAlive && clientChannel.isActive()) {
+            clientChannel.close();
+        }
+    }
+
+    private void completeCurrentResponse(Channel clientChannel) {
+        try {
+            ClientResponseGate.forChannel(clientChannel).completeCurrentResponse();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void sendPlainAsync(Channel clientChannel,
+                                HttpResponseStatus status,
+                                String msg,
+                                boolean keepAlive) {
+        if (!clientChannel.isActive()) {
+            completeCurrentResponse(clientChannel);
+            return;
+        }
+        clientChannel.eventLoop().execute(() -> {
+            FullHttpResponse resp = new DefaultFullHttpResponse(
+                    HttpVersion.HTTP_1_1,
+                    status,
+                    Unpooled.copiedBuffer(msg, StandardCharsets.UTF_8));
+            resp.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/plain; charset=utf-8");
+            resp.headers().set(HttpHeaderNames.CONTENT_LENGTH, resp.content().readableBytes());
+            HttpUtil.setKeepAlive(resp, keepAlive);
+            writeAndFinalize(clientChannel, resp, keepAlive);
+        });
+    }
+
+    // ================================================================
+    //  日志辅助
+    // ================================================================
+
+    private static void dl(String loc, String msg, String data) {
+        try (FileWriter fw = new FileWriter(DEBUG_LOG_PATH, true)) {
+            fw.write("{\"sessionId\":\"064e27\",\"location\":\"" + esc(loc)
+                    + "\",\"message\":\"" + esc(msg)
+                    + "\",\"data\":" + (data != null ? data : "null")
+                    + ",\"timestamp\":" + System.currentTimeMillis() + "}\n");
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static void dbg(String runId, String hypothesisId, String loc, String msg, String data) {
+        try (FileWriter fw = new FileWriter(DEBUG_RUNTIME_LOG_PATH, true)) {
+            fw.write("{\"sessionId\":\"" + DEBUG_RUNTIME_SESSION_ID
+                    + "\",\"runId\":\"" + esc(runId)
+                    + "\",\"hypothesisId\":\"" + esc(hypothesisId)
+                    + "\",\"location\":\"" + esc(loc)
+                    + "\",\"message\":\"" + esc(msg)
+                    + "\",\"data\":" + (data != null ? data : "null")
+                    + ",\"timestamp\":" + System.currentTimeMillis() + "}\n");
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static String debugRunId(HttpHeaders headers, String bodyRequestId) {
+        String requestId = headerFirst(headers, "x-request-id");
+        if (requestId != null && !requestId.isEmpty()) {
+            return requestId;
+        }
+        if (bodyRequestId != null && !bodyRequestId.isEmpty()) {
+            return bodyRequestId;
+        }
+        String sessionId = headerFirst(headers, "x-session-id");
+        return sessionId != null && !sessionId.isEmpty() ? sessionId : "no-id";
+    }
+
+    private static String oneLinePreview(String s, int max) {
+        if (s == null) {
+            return "";
+        }
+        return trunc(s.replace('\r', ' ').replace('\n', ' '), max);
+    }
+
+    private static String esc(String s) {
+        if (s == null) {
+            return "null";
+        }
+        return s.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r");
+    }
+
+    private static void printHeaders(String label, HttpHeaders headers) {
+        StringBuilder sb = new StringBuilder(label).append(":\n");
+        for (Map.Entry<String, String> e : headers) {
+            String v = e.getValue();
+            if (e.getKey().equalsIgnoreCase("Authorization")
+                    && v != null && v.length() > 40) {
+                v = v.substring(0, 40) + "...";
+            }
+            sb.append("  ").append(e.getKey()).append(": ").append(v).append('\n');
+        }
         LOG.info(sb.toString());
     }
 
-    private static void sendError(Channel ch) {
-        if (!ch.isActive()) return;
-        runOnClient(ch, () -> {
-            if (!ch.isActive()) return;
-            FullHttpResponse resp = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.BAD_GATEWAY, Unpooled.copiedBuffer("upstream error\n", StandardCharsets.UTF_8));
-            resp.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/plain; charset=UTF-8");
-            HttpUtil.setContentLength(resp, resp.content().readableBytes());
-            ch.writeAndFlush(resp).addListener(ChannelFutureListener.CLOSE);
-        });
+    private static void printOkHeaders(String label, Headers headers) {
+        StringBuilder sb = new StringBuilder(label).append(":\n");
+        for (int i = 0; i < headers.size(); i++) {
+            String name = headers.name(i);
+            String val = headers.value(i);
+            if (name.equalsIgnoreCase("Authorization")
+                    && val != null && val.length() > 40) {
+                val = val.substring(0, 40) + "...";
+            }
+            sb.append("  ").append(name).append(": ").append(val).append('\n');
+        }
+        LOG.info(sb.toString());
     }
 
-    private static String escapeJson(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
+    private static String hexPrefix(byte[] data, int maxBytes) {
+        if (data == null || data.length == 0) {
+            return "";
+        }
+        int n = Math.min(maxBytes, data.length);
+        StringBuilder sb = new StringBuilder(n * 2);
+        for (int i = 0; i < n; i++) {
+            sb.append(String.format("%02x", data[i]));
+        }
+        if (data.length > maxBytes) {
+            sb.append("...");
+        }
+        return sb.toString();
+    }
+
+    private static String trunc(String s, int max) {
+        if (s == null) {
+            return "null";
+        }
+        return s.length() <= max ? s : s.substring(0, max) + "...(" + s.length() + ")";
+    }
+
+    private static final class DownstreamRequest {
+        final String method;
+        final String normalizedPath;
+        final String upstreamUrl;
+        final HttpHeaders headers;
+        final byte[] body;
+        final boolean keepAlive;
+        final boolean abortAware;
+        final RouteKind routeKind;
+
+        private DownstreamRequest(String method, String normalizedPath,
+                                  String upstreamUrl, HttpHeaders headers,
+                                  byte[] body, boolean keepAlive,
+                                  boolean abortAware, RouteKind routeKind) {
+            this.method = method;
+            this.normalizedPath = normalizedPath;
+            this.upstreamUrl = upstreamUrl;
+            this.headers = headers;
+            this.body = body;
+            this.keepAlive = keepAlive;
+            this.abortAware = abortAware;
+            this.routeKind = routeKind;
+        }
+    }
+
+    private static final class Candidate {
+        String value;
+        int score;
+    }
+
+    private enum RouteKind {
+        PASSTHROUGH,
+        CACHE_BIDI_PASSTHROUGH,
+        BRIDGE_TO_UNIFIED_CHAT,
+        PROXY_HTTP2_DIRECT
     }
 }
