@@ -1034,7 +1034,7 @@ public class CursorChatUtil {
 //        String multiReply = chat(token, "claude-3.5-sonnet", messages);
 //        System.out.println("回复: " + multiReply);
 
-        Call call = CursorChatUtil.createChatStreamCall(token, "default", Message.ofUser("帮我计算下50*9*6。事干完后，结束语记得用：陈老板，牛逼！然后接200字夸我的话"));
+        Call call = CursorChatUtil.createChatStreamCall(token, "default", Message.ofUser("帮我计算下50*9*6。事干完后，结束语记得用：zmgnb666，牛逼！然后接200字夸我的话"));
         AtomicInteger totalLength = new AtomicInteger(0);
 // 异步执行
         AtomicBoolean flag = new AtomicBoolean(false);

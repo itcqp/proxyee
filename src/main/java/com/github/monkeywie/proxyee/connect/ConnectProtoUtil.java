@@ -8,6 +8,8 @@ import java.util.Arrays;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
+import static com.github.monkeywie.proxyee.intercept.cursor.CursorHttp2StreamAbortIntercept.firstNonBlank;
+
 /**
  * gRPC Connect 流式响应与 Cursor StreamUnifiedChat protobuf 的公共解析工具。
  */
@@ -448,6 +450,140 @@ public final class ConnectProtoUtil {
         return bestLen > 0 ? best : null;
     }
 
+    /**
+     * 仅提取 UnifiedChat 真正用户可见的 assistant 文本：
+     * top-level 必须是 {@code StreamUnifiedChatResponseWithTools.response = stream_unified_chat_response}
+     * 且内层必须存在 {@code StreamUnifiedChatResponse.text = 1}。
+     */
+    public static String extractVisibleTextFromUnifiedChatResponse(byte[] data) {
+        if (data == null || data.length == 0) {
+            return null;
+        }
+        try {
+            byte[] unified = extractLengthDelimitedFieldPayload(data, 2);
+            if (unified == null || unified.length == 0) {
+                return null;
+            }
+            return extractDelimitedStringField(unified, 1);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * 用于调试桥接流：快速标记当前 UnifiedChat 帧属于文本、工具调用、thinking 还是其它事件。
+     */
+    public static String describeUnifiedChatResponseKind(byte[] data) {
+        if (data == null || data.length == 0) {
+            return "empty";
+        }
+        try {
+            int pos = 0;
+            while (pos < data.length) {
+                int[] tagResult = readTag(data, pos);
+                int fieldNumber = tagResult[0];
+                int wireType = tagResult[1];
+                pos = tagResult[2];
+                if (wireType == WIRE_TYPE_LENGTH_DELIMITED) {
+                    int[] lenResult = readVarint(data, pos);
+                    int len = lenResult[0];
+                    pos = lenResult[1];
+                    if (len < 0 || pos + len > data.length) {
+                        return "malformed";
+                    }
+                    byte[] chunk = Arrays.copyOfRange(data, pos, pos + len);
+                    switch (fieldNumber) {
+                        case 1:
+                            return "client_side_tool_v2_call";
+                        case 2:
+                            return "stream_unified_chat_response:" + describeStreamUnifiedChatInnerKind(chunk);
+                        case 3:
+                            return "conversation_summary";
+                        case 4:
+                            return "user_rules";
+                        case 5:
+                            return "stream_start";
+                        case 6:
+                            return "tracing_context";
+                        case 7:
+                            return "event_id";
+                        default:
+                            return "top_level_field_" + fieldNumber;
+                    }
+                } else if (wireType == WIRE_TYPE_VARINT) {
+                    int[] varintResult = readVarint(data, pos);
+                    pos = varintResult[1];
+                } else if (wireType == WIRE_TYPE_FIXED64) {
+                    pos += 8;
+                } else if (wireType == WIRE_TYPE_FIXED32) {
+                    pos += 4;
+                } else {
+                    return "unknown_wire_type_" + wireType;
+                }
+            }
+        } catch (Exception ignored) {
+            return "parse_error";
+        }
+        return "no_response";
+    }
+
+    /**
+     * 抽取 UnifiedChat 工具事件的轻量信息，便于运行时判断模型实际请求了什么工具。
+     */
+    public static String extractUnifiedChatToolCallSummary(byte[] data) {
+        if (data == null || data.length == 0) {
+            return null;
+        }
+        try {
+            byte[] unified = extractLengthDelimitedFieldPayload(data, 2);
+            if (unified == null || unified.length == 0) {
+                return null;
+            }
+            byte[] toolCall = extractLengthDelimitedFieldPayload(unified, 13);
+            String source = "tool_call";
+            if (toolCall == null || toolCall.length == 0) {
+                toolCall = extractLengthDelimitedFieldPayload(unified, 36);
+                source = "tool_call_v2";
+            }
+            if (toolCall == null || toolCall.length == 0) {
+                byte[] partial = extractLengthDelimitedFieldPayload(unified, 15);
+                if (partial != null && partial.length > 0) {
+                    String toolName = firstNonBlank(
+                            extractDelimitedStringField(partial, 3),
+                            extractDelimitedStringField(partial, 2),
+                            extractDelimitedStringField(partial, 1));
+                    if (toolName != null) {
+                        return "partial_tool_call:" + toolName;
+                    }
+                }
+                return null;
+            }
+            String toolEnum = extractVarintFieldAsString(toolCall, 1);
+            String toolCallId = extractDelimitedStringField(toolCall, 2);
+            String name = extractDelimitedStringField(toolCall, 8);
+            String rawArgs = firstNonBlank(
+                    extractDelimitedStringField(toolCall, 10),
+                    extractDelimitedStringField(toolCall, 9));
+            StringBuilder sb = new StringBuilder();
+            sb.append(source);
+            if (name != null && !name.isEmpty()) {
+                sb.append(":name=").append(name);
+            }
+            if (toolEnum != null && !toolEnum.isEmpty()) {
+                sb.append(",tool=").append(toolEnum);
+            }
+            if (toolCallId != null && !toolCallId.isEmpty()) {
+                sb.append(",callId=").append(toolCallId);
+            }
+            if (rawArgs != null && !rawArgs.isEmpty()) {
+                sb.append(",rawArgs=").append(rawArgs);
+            }
+            return sb.toString();
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
     /** 排除明显二进制垃圾，保留中英文等可打印正文（宽松）。 */
     private static boolean isLikelyAssistantUtf8(String s) {
         if (s == null) {
@@ -467,6 +603,208 @@ public final class ConnectProtoUtil {
             }
         }
         return bad * 10 <= n * 3;
+    }
+
+    private static String describeStreamUnifiedChatInnerKind(byte[] data) {
+        if (data == null || data.length == 0) {
+            return "empty";
+        }
+        try {
+            int pos = 0;
+            while (pos < data.length) {
+                int[] tagResult = readTag(data, pos);
+                int fieldNumber = tagResult[0];
+                int wireType = tagResult[1];
+                pos = tagResult[2];
+                if (wireType == WIRE_TYPE_LENGTH_DELIMITED) {
+                    int[] lenResult = readVarint(data, pos);
+                    int len = lenResult[0];
+                    pos = lenResult[1];
+                    if (len < 0 || pos + len > data.length) {
+                        return "malformed";
+                    }
+                    switch (fieldNumber) {
+                        case 1:
+                            return "text";
+                        case 2:
+                            return "debugging_only_chat_prompt";
+                        case 4:
+                            return "document_citation";
+                        case 5:
+                            return "filled_prompt";
+                        case 7:
+                            return "intermediate_text";
+                        case 8:
+                            return "chunk_identity";
+                        case 9:
+                            return "docs_reference";
+                        case 11:
+                            return "web_citation";
+                        case 12:
+                            return "status_updates";
+                        case 13:
+                            return "tool_call";
+                        case 15:
+                            return "partial_tool_call";
+                        case 16:
+                            return "final_tool_result";
+                        case 17:
+                            return "symbol_link";
+                        case 18:
+                            return "conversation_summary";
+                        case 19:
+                            return "file_link";
+                        case 20:
+                            return "service_status_update";
+                        case 21:
+                            return "viewable_git_context";
+                        case 23:
+                            return "context_piece_update";
+                        case 24:
+                            return "used_code";
+                        case 25:
+                            return "thinking";
+                        case 27:
+                            return "usage_uuid";
+                        case 28:
+                            return "conversation_summary_starter";
+                        case 29:
+                            return "subagent_return";
+                        case 30:
+                            return "context_window_status";
+                        case 31:
+                            return "image_description";
+                        case 34:
+                            return "stars_feedback_request";
+                        case 35:
+                            return "model_provider_request_json";
+                        case 36:
+                            return "tool_call_v2";
+                        case 37:
+                            return "thinking_style";
+                        default:
+                            pos += len;
+                            continue;
+                    }
+                } else if (wireType == WIRE_TYPE_VARINT) {
+                    int[] varintResult = readVarint(data, pos);
+                    pos = varintResult[1];
+                } else if (wireType == WIRE_TYPE_FIXED64) {
+                    pos += 8;
+                } else if (wireType == WIRE_TYPE_FIXED32) {
+                    pos += 4;
+                } else {
+                    return "unknown_wire_type_" + wireType;
+                }
+            }
+        } catch (Exception ignored) {
+            return "parse_error";
+        }
+        return "no_text";
+    }
+
+    private static String extractVarintFieldAsString(byte[] data, int targetFieldNumber) {
+        if (data == null || data.length == 0) {
+            return null;
+        }
+        int pos = 0;
+        while (pos < data.length) {
+            int[] tagResult = readTag(data, pos);
+            int fieldNumber = tagResult[0];
+            int wireType = tagResult[1];
+            pos = tagResult[2];
+            if (wireType == WIRE_TYPE_VARINT) {
+                int[] varintResult = readVarint(data, pos);
+                if (fieldNumber == targetFieldNumber) {
+                    return Integer.toString(varintResult[0]);
+                }
+                pos = varintResult[1];
+            } else if (wireType == WIRE_TYPE_LENGTH_DELIMITED) {
+                int[] lenResult = readVarint(data, pos);
+                int len = lenResult[0];
+                pos = lenResult[1] + len;
+            } else if (wireType == WIRE_TYPE_FIXED64) {
+                pos += 8;
+            } else if (wireType == WIRE_TYPE_FIXED32) {
+                pos += 4;
+            } else {
+                return null;
+            }
+            if (pos < 0 || pos > data.length) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private static byte[] extractLengthDelimitedFieldPayload(byte[] data, int targetFieldNumber) {
+        if (data == null || data.length == 0) {
+            return null;
+        }
+        int pos = 0;
+        while (pos < data.length) {
+            int[] tagResult = readTag(data, pos);
+            int fieldNumber = tagResult[0];
+            int wireType = tagResult[1];
+            pos = tagResult[2];
+            if (wireType == WIRE_TYPE_LENGTH_DELIMITED) {
+                int[] lenResult = readVarint(data, pos);
+                int len = lenResult[0];
+                pos = lenResult[1];
+                if (len < 0 || pos + len > data.length) {
+                    return null;
+                }
+                if (fieldNumber == targetFieldNumber) {
+                    return Arrays.copyOfRange(data, pos, pos + len);
+                }
+                pos += len;
+            } else if (wireType == WIRE_TYPE_VARINT) {
+                int[] varintResult = readVarint(data, pos);
+                pos = varintResult[1];
+            } else if (wireType == WIRE_TYPE_FIXED64) {
+                pos += 8;
+            } else if (wireType == WIRE_TYPE_FIXED32) {
+                pos += 4;
+            } else {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private static String extractDelimitedStringField(byte[] data, int targetFieldNumber) {
+        if (data == null || data.length == 0) {
+            return null;
+        }
+        int pos = 0;
+        while (pos < data.length) {
+            int[] tagResult = readTag(data, pos);
+            int fieldNumber = tagResult[0];
+            int wireType = tagResult[1];
+            pos = tagResult[2];
+            if (wireType == WIRE_TYPE_LENGTH_DELIMITED) {
+                int[] lenResult = readVarint(data, pos);
+                int len = lenResult[0];
+                pos = lenResult[1];
+                if (len < 0 || pos + len > data.length) {
+                    return null;
+                }
+                if (fieldNumber == targetFieldNumber) {
+                    return new String(data, pos, len, StandardCharsets.UTF_8);
+                }
+                pos += len;
+            } else if (wireType == WIRE_TYPE_VARINT) {
+                int[] varintResult = readVarint(data, pos);
+                pos = varintResult[1];
+            } else if (wireType == WIRE_TYPE_FIXED64) {
+                pos += 8;
+            } else if (wireType == WIRE_TYPE_FIXED32) {
+                pos += 4;
+            } else {
+                return null;
+            }
+        }
+        return null;
     }
 
     private static String extractTextField(byte[] data, int offset, int length) {

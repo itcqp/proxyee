@@ -49,9 +49,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
-import java.util.Locale;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -395,6 +393,7 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         int totalFrames = 0;
         int dataFrames = 0;
         int textFrames = 0;
+        int responseKindLogs = 0;
         String abortToken = new String(abortTokenBytes, StandardCharsets.UTF_8);
         StringBuilder emittedTextWindow = new StringBuilder();
         try (InputStream is = body.byteStream();
@@ -447,7 +446,7 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                                 }
                             }
                             String text = sanitizeAssistantText(
-                                    ConnectProtoUtil.extractTextFromResponseLenient(effectivePayload));
+                                    ConnectProtoUtil.extractVisibleTextFromUnifiedChatResponse(effectivePayload));
                             byte[] turnEndedFrame = buildAgentTurnEndedFrame();
                             byte[] connectTrailerFrame = buildConnectSuccessEndStreamFrame();
                             // #region agent log
@@ -506,7 +505,22 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                         }
                     }
 
-                    String rawText = ConnectProtoUtil.extractTextFromResponseLenient(effectivePayload);
+                    String responseKind = ConnectProtoUtil.describeUnifiedChatResponseKind(effectivePayload);
+                    if (responseKindLogs < 24) {
+                        String toolSummary = ConnectProtoUtil.extractUnifiedChatToolCallSummary(effectivePayload);
+                        // #region agent log
+                        dbg("bridge-stream", "H_RESP",
+                                "CursorHttp2StreamAbortIntercept.streamUnifiedChatAsAgentRunSse",
+                                "bridge_response_frame_kind",
+                                "{\"frameIdx\":" + frameIdx
+                                        + ",\"kind\":\"" + esc(responseKind)
+                                        + "\",\"toolSummary\":\"" + esc(oneLinePreview(toolSummary, 240))
+                                        + "\",\"compressed\":" + compressed
+                                        + ",\"payloadLen\":" + effectivePayload.length + "}");
+                        // #endregion
+                        responseKindLogs++;
+                    }
+                    String rawText = ConnectProtoUtil.extractVisibleTextFromUnifiedChatResponse(effectivePayload);
                     String text = sanitizeAssistantText(rawText);
                     if (text != null && !text.isEmpty()) {
                         emittedTextWindow.append(text);
@@ -604,6 +618,7 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                                     "CursorHttp2StreamAbortIntercept.streamUnifiedChatAsAgentRunSse",
                                     "bridge_first_text_frame",
                                     "{\"frameIdx\":" + frameIdx
+                                            + ",\"kind\":\"" + esc(responseKind)
                                             + ",\"compressed\":" + compressed
                                             + ",\"rawUpstreamTextPreview\":\"" + esc(oneLinePreview(rawText, 120))
                                             + "\",\"sanitizedTextPreview\":\"" + esc(oneLinePreview(text, 120))
@@ -1213,14 +1228,31 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             byte[] action = null;
             byte[] conversationState = null;
             byte[] requestContext = null;
+            byte[] requestEnv = null;
             byte[] selectedContext = null;
+            byte[] invocationContext = null;
+            byte[] ideState = null;
             byte[] skillOptions = null;
             String rulePathsPreview = null;
+            String workspacePathsPreview = null;
+            String requestContextToolPreview = null;
+            String repositoryInfoPreview = null;
+            String projectLayoutsPreview = null;
+            String fileContentsPreview = null;
+            String selectedFilesPreview = null;
+            String visibleFilesPreview = null;
             int prependUserMessagesCount = 0;
             int requestContextRulesCount = 0;
+            int workspacePathsCount = 0;
+            int requestContextToolCount = 0;
+            int repositoryInfoCount = 0;
+            int projectLayoutsCount = 0;
+            int fileContentsCount = 0;
             int selectedCursorRulesCount = 0;
             int selectedFilesCount = 0;
             int extraContextCount = 0;
+            int visibleFilesCount = 0;
+            int recentlyViewedFilesCount = 0;
             int rootPromptMessagesCount = 0;
             int turnCount = 0;
             int skillDescriptorsCount = 0;
@@ -1254,11 +1286,28 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             selectedContext = extractMessageField(userMessage, 3);
             requestContextRulesCount = countLengthDelimitedField(requestContext, 2);
             rulePathsPreview = extractRulePathsPreview(requestContext, 20);
+            requestEnv = extractMessageField(requestContext, 4);
+            workspacePathsCount = countLengthDelimitedField(requestEnv, 2);
+            workspacePathsPreview = extractRepeatedStringFieldPreview(requestEnv, 2, 4);
+            requestContextToolCount = countLengthDelimitedField(requestContext, 7);
+            requestContextToolPreview = extractMcpToolNamesPreview(requestContext, 5);
+            repositoryInfoCount = countLengthDelimitedField(requestContext, 6);
+            repositoryInfoPreview = extractRepositoryInfoPreview(requestContext, 4);
+            projectLayoutsCount = countLengthDelimitedField(requestContext, 13);
+            projectLayoutsPreview = extractProjectLayoutPreview(requestContext, 3);
+            fileContentsCount = countLengthDelimitedField(requestContext, 20);
+            fileContentsPreview = extractMapKeyPreview(requestContext, 20, 4);
             skillOptions = extractMessageField(requestContext, 18);
             skillDescriptorsCount = countLengthDelimitedField(skillOptions, 1);
             selectedCursorRulesCount = countLengthDelimitedField(selectedContext, 10);
             selectedFilesCount = countLengthDelimitedField(selectedContext, 4);
+            selectedFilesPreview = extractSelectedFilePathsPreview(selectedContext, 5);
             extraContextCount = countLengthDelimitedField(selectedContext, 3);
+            invocationContext = extractMessageField(selectedContext, 2);
+            ideState = extractMessageField(invocationContext, 3);
+            visibleFilesCount = countLengthDelimitedField(ideState, 1);
+            recentlyViewedFilesCount = countLengthDelimitedField(ideState, 2);
+            visibleFilesPreview = extractIdeStateFilesPreview(ideState, 1, 5);
             rulesContext = extractRulesContext(requestContext);
             // #region agent log
             dbg(debugRunId(request.headers(), outerRequestId), "H6",
@@ -1277,6 +1326,25 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                             + ",\"selectedFilesCount\":" + selectedFilesCount
                             + ",\"extraContextCount\":" + extraContextCount
                             + ",\"rulesContextLen\":" + (rulesContext == null ? 0 : rulesContext.length()) + "}");
+            // #endregion
+            // #region agent log
+            dbg(debugRunId(request.headers(), outerRequestId), "H_CTX",
+                    "CursorHttp2StreamAbortIntercept.cacheBidiContext",
+                    "bidi_context_deep_probe",
+                    "{\"workspacePathsCount\":" + workspacePathsCount
+                            + ",\"workspacePathsPreview\":\"" + esc(workspacePathsPreview)
+                            + "\",\"requestContextToolCount\":" + requestContextToolCount
+                            + ",\"requestContextToolPreview\":\"" + esc(requestContextToolPreview)
+                            + "\",\"repositoryInfoCount\":" + repositoryInfoCount
+                            + ",\"repositoryInfoPreview\":\"" + esc(repositoryInfoPreview)
+                            + "\",\"projectLayoutsCount\":" + projectLayoutsCount
+                            + ",\"projectLayoutsPreview\":\"" + esc(projectLayoutsPreview)
+                            + "\",\"fileContentsCount\":" + fileContentsCount
+                            + ",\"fileContentsPreview\":\"" + esc(fileContentsPreview)
+                            + "\",\"selectedFilesPreview\":\"" + esc(selectedFilesPreview)
+                            + "\",\"visibleFilesCount\":" + visibleFilesCount
+                            + ",\"recentlyViewedFilesCount\":" + recentlyViewedFilesCount
+                            + ",\"visibleFilesPreview\":\"" + esc(visibleFilesPreview) + "\"}");
             // #endregion
         }
         if (sessionId != null && !sessionId.isEmpty()
@@ -1462,6 +1530,172 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         return sb.length() == 0 ? null : sb.toString();
     }
 
+    private static String extractRepeatedStringFieldPreview(byte[] protobuf, int fieldNumber, int limit) {
+        if (protobuf == null || protobuf.length == 0 || limit <= 0) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (String value : extractRepeatedStringFields(protobuf, fieldNumber)) {
+            if (value == null || value.trim().isEmpty()) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(" | ");
+            }
+            sb.append(value.trim());
+            count++;
+            if (count >= limit) {
+                break;
+            }
+        }
+        return sb.length() == 0 ? null : sb.toString();
+    }
+
+    private static String extractMcpToolNamesPreview(byte[] requestContext, int limit) {
+        if (requestContext == null || requestContext.length == 0 || limit <= 0) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (byte[] toolMsg : extractRepeatedMessageFields(requestContext, 7)) {
+            String name = firstNonBlank(
+                    extractStringField(toolMsg, 1),
+                    extractStringField(toolMsg, 5),
+                    extractStringField(toolMsg, 2));
+            if (name == null || name.trim().isEmpty()) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(" | ");
+            }
+            sb.append(name.trim());
+            count++;
+            if (count >= limit) {
+                break;
+            }
+        }
+        return sb.length() == 0 ? null : sb.toString();
+    }
+
+    private static String extractRepositoryInfoPreview(byte[] requestContext, int limit) {
+        if (requestContext == null || requestContext.length == 0 || limit <= 0) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (byte[] repoMsg : extractRepeatedMessageFields(requestContext, 6)) {
+            String value = firstNonBlank(
+                    extractStringField(repoMsg, 1),
+                    extractStringField(repoMsg, 9),
+                    extractStringField(repoMsg, 4));
+            if (value == null || value.trim().isEmpty()) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(" | ");
+            }
+            sb.append(value.trim());
+            count++;
+            if (count >= limit) {
+                break;
+            }
+        }
+        return sb.length() == 0 ? null : sb.toString();
+    }
+
+    private static String extractProjectLayoutPreview(byte[] requestContext, int limit) {
+        if (requestContext == null || requestContext.length == 0 || limit <= 0) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (byte[] layoutMsg : extractRepeatedMessageFields(requestContext, 13)) {
+            String path = extractStringField(layoutMsg, 1);
+            if (path == null || path.trim().isEmpty()) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(" | ");
+            }
+            sb.append(path.trim());
+            count++;
+            if (count >= limit) {
+                break;
+            }
+        }
+        return sb.length() == 0 ? null : sb.toString();
+    }
+
+    private static String extractMapKeyPreview(byte[] protobuf, int fieldNumber, int limit) {
+        if (protobuf == null || protobuf.length == 0 || limit <= 0) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (byte[] entryMsg : extractRepeatedMessageFields(protobuf, fieldNumber)) {
+            String key = extractStringField(entryMsg, 1);
+            if (key == null || key.trim().isEmpty()) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(" | ");
+            }
+            sb.append(key.trim());
+            count++;
+            if (count >= limit) {
+                break;
+            }
+        }
+        return sb.length() == 0 ? null : sb.toString();
+    }
+
+    private static String extractSelectedFilePathsPreview(byte[] selectedContext, int limit) {
+        if (selectedContext == null || selectedContext.length == 0 || limit <= 0) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (byte[] fileMsg : extractRepeatedMessageFields(selectedContext, 4)) {
+            String path = firstNonBlank(extractStringField(fileMsg, 3), extractStringField(fileMsg, 2));
+            if (path == null || path.trim().isEmpty()) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(" | ");
+            }
+            sb.append(path.trim());
+            count++;
+            if (count >= limit) {
+                break;
+            }
+        }
+        return sb.length() == 0 ? null : sb.toString();
+    }
+
+    private static String extractIdeStateFilesPreview(byte[] ideState, int fieldNumber, int limit) {
+        if (ideState == null || ideState.length == 0 || limit <= 0) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (byte[] fileMsg : extractRepeatedMessageFields(ideState, fieldNumber)) {
+            String path = firstNonBlank(extractStringField(fileMsg, 2), extractStringField(fileMsg, 1));
+            if (path == null || path.trim().isEmpty()) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(" | ");
+            }
+            sb.append(path.trim());
+            count++;
+            if (count >= limit) {
+                break;
+            }
+        }
+        return sb.length() == 0 ? null : sb.toString();
+    }
+
     private static String findRichTextPayload(byte[] protobuf) {
         Candidate best = new Candidate();
         collectRichTextCandidates(protobuf, 0, 6, best);
@@ -1580,6 +1814,47 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             }
         }
         return null;
+    }
+
+    private static List<String> extractRepeatedStringFields(byte[] protobuf, int wantedField) {
+        List<String> out = new ArrayList<>();
+        if (protobuf == null || protobuf.length == 0) {
+            return out;
+        }
+        int pos = 0;
+        while (pos < protobuf.length) {
+            int[] tag = readTag(protobuf, pos);
+            if (tag == null) {
+                return out;
+            }
+            int fieldNumber = tag[0];
+            int wireType = tag[1];
+            pos = tag[2];
+            if (wireType == 2) {
+                int[] len = readVarint(protobuf, pos);
+                if (len == null) {
+                    return out;
+                }
+                int size = len[0];
+                pos = len[1];
+                if (size < 0 || pos + size > protobuf.length) {
+                    return out;
+                }
+                if (fieldNumber == wantedField) {
+                    String value = safeUtf8(protobuf, pos, size);
+                    if (value != null) {
+                        out.add(value);
+                    }
+                }
+                pos += size;
+            } else {
+                pos = skipField(protobuf, pos, wireType);
+                if (pos < 0) {
+                    return out;
+                }
+            }
+        }
+        return out;
     }
 
     private static byte[] extractMessageField(byte[] protobuf, int wantedField) {
@@ -2096,7 +2371,7 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         return payload.length <= requestId.length() + 4;
     }
 
-    private static String firstNonBlank(String... values) {
+    public static String firstNonBlank(String... values) {
         if (values == null) {
             return null;
         }
