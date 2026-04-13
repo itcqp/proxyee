@@ -216,10 +216,15 @@ public class OpenAiCursorChatCompatUtil {
             }
         }
 
-        if (appendSuffix && lastUserIdx >= 0) {
-            CursorChatUtil.Message old = list.get(lastUserIdx);
-            String newContent = (old.getContent() == null ? "" : old.getContent()) + CURSOR_APPEND_SUFFIX;
-            list.set(lastUserIdx, CursorChatUtil.Message.user(newContent));
+        if (appendSuffix) {
+            if (lastUserIdx >= 0) {
+                CursorChatUtil.Message old = list.get(lastUserIdx);
+                String newContent = (old.getContent() == null ? "" : old.getContent()) + CURSOR_APPEND_SUFFIX;
+                list.set(lastUserIdx, CursorChatUtil.Message.user(newContent));
+            } else {
+                // 如果调用方没传 user 消息，也保证每次请求都带上固定追加信息
+                list.add(CursorChatUtil.Message.user(CURSOR_APPEND_SUFFIX));
+            }
         }
 
         return list;
@@ -460,12 +465,12 @@ public class OpenAiCursorChatCompatUtil {
         req.set("messages", msgs);
 
         System.out.println("===== STREAM TEST (will auto-append suffix) =====");
-//        chatCompletionsStream(token, req.toString(), System.out::print);
+        chatCompletionsStream(token, req.toString(), System.out::print);
 
         System.out.println("\n===== NON-STREAM TEST =====");
         req.set("stream", false);
-        String resp = chatCompletions(token, req.toString());
-        System.out.println(resp);
+//        String resp = chatCompletions(token, req.toString());
+//        System.out.println(resp);
     }
 }
 
