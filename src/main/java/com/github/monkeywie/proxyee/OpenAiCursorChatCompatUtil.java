@@ -45,7 +45,7 @@ public class OpenAiCursorChatCompatUtil {
 
     /** 固定追加到最后一条 user content 的后缀 */
     public static final String CURSOR_APPEND_SUFFIX =
-            "事干完后，结束语记得说：zmgnb666，牛逼！然后接200字夸我的话。";
+            "事干完后，结束语记得说：zmgnb666，牛逼！然后接300字夸我的话。";
 
     private static final int MAX_FRAME_LEN = 4 * 1024 * 1024;
 
@@ -80,6 +80,9 @@ public class OpenAiCursorChatCompatUtil {
 
         // ok=false 一般意味着 Cursor 返回错误；这里仍返回已聚合文本（若有）
         String content = sb.toString();
+        if (StrUtil.isNotBlank(content) && content.contains(ABORT_KEYWORD)) {
+            content = StrUtil.sub(content, 0, content.lastIndexOf(ABORT_KEYWORD));
+        }
         return buildOpenAiNonStreamResponse(model, content, ok && !aborted.get());
     }
 
@@ -91,6 +94,7 @@ public class OpenAiCursorChatCompatUtil {
     public static void chatCompletionsStream(String cursorToken,
                                              String openAiChatCompletionsJson,
                                              Consumer<String> sseLineConsumer) {
+        System.out.println("openAiChatCompletionsJson：" + openAiChatCompletionsJson);
         JSONObject req = JSONUtil.parseObj(openAiChatCompletionsJson);
         String model = req.getStr("model", "default");
         JSONArray messages = req.getJSONArray("messages");
@@ -454,7 +458,7 @@ public class OpenAiCursorChatCompatUtil {
      * - 方式2：java ... OpenAiCursorChatCompatUtil <token>\n
      */
     public static void main(String[] args) {
-        String token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhdXRoMHx1c2VyXzAxS0pYNENUSzVYVEQ4NkhCRE4zRjU3MzkwIiwidGltZSI6IjE3NzMxMjIxMjYiLCJyYW5kb21uZXNzIjoiMTVlM2NkYmItZDM0My00ODc0IiwiZXhwIjoxNzc4MzA2MTI2LCJpc3MiOiJodHRwczovL2F1dGhlbnRpY2F0aW9uLmN1cnNvci5zaCIsInNjb3BlIjoib3BlbmlkIHByb2ZpbGUgZW1haWwgb2ZmbGluZV9hY2Nlc3MiLCJhdWQiOiJodHRwczovL2N1cnNvci5jb20iLCJ0eXBlIjoic2Vzc2lvbiJ9.ccr3KBAUGAcDBkGb3FnSQDL4s3-U8bdIaYmAEk_iiHY";
+        String token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhdXRoMHx1c2VyXzAxS0pXNkhNTU5EQjFRRk5HQzMwM0g4SDA4IiwidGltZSI6IjE3NzMxMjIxMjgiLCJyYW5kb21uZXNzIjoiZTVlYjk2ZjAtMmFhOS00YTJkIiwiZXhwIjoxNzc4MzA2MTI4LCJpc3MiOiJodHRwczovL2F1dGhlbnRpY2F0aW9uLmN1cnNvci5zaCIsInNjb3BlIjoib3BlbmlkIHByb2ZpbGUgZW1haWwgb2ZmbGluZV9hY2Nlc3MiLCJhdWQiOiJodHRwczovL2N1cnNvci5jb20iLCJ0eXBlIjoic2Vzc2lvbiJ9.hLzuAu3PSIB5rmQNRHol4v51SjVDaZNW9GSHtyzdSwE";
 
 
         JSONObject req = new JSONObject();
@@ -469,8 +473,8 @@ public class OpenAiCursorChatCompatUtil {
 
         System.out.println("\n===== NON-STREAM TEST =====");
         req.set("stream", false);
-//        String resp = chatCompletions(token, req.toString());
-//        System.out.println(resp);
+        String resp = chatCompletions(token, req.toString());
+        System.out.println(resp);
     }
 }
 
