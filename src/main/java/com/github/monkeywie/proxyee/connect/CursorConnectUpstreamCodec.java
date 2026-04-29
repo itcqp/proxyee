@@ -6,13 +6,13 @@ import io.netty.handler.codec.http.HttpHeaders;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -34,6 +34,9 @@ public final class CursorConnectUpstreamCodec {
     private static final int MESSAGE_TYPE_HUMAN = 1;
     private static final int MESSAGE_TYPE_AI = 2;
     private static final int UNIFIED_MODE_CHAT = 1;
+    private static final int UNIFIED_MODE_AGENT = 2;
+    private static final int UNIFIED_MODE_PLAN = 5;
+    private static final int UNIFIED_MODE_DEBUG = 6;
 
     private CursorConnectUpstreamCodec() {}
 
@@ -81,6 +84,149 @@ public final class CursorConnectUpstreamCodec {
             }
             messages.add(user(userContent));
             return messages;
+        }
+    }
+
+    public static final class UnifiedChatTool {
+        public final String name;
+        public final String description;
+        public final String parameters;
+        public final String serverName;
+
+        public UnifiedChatTool(String name, String description, String parameters, String serverName) {
+            this.name = name;
+            this.description = description;
+            this.parameters = parameters;
+            this.serverName = serverName;
+        }
+    }
+
+    public static final class WorkspaceFolderContext {
+        public final String uri;
+        public final String name;
+
+        public WorkspaceFolderContext(String uri, String name) {
+            this.uri = uri;
+            this.name = name;
+        }
+    }
+
+    public static final class EnvironmentContext {
+        public final String exthostPlatform;
+        public final String exthostRelease;
+        public final String exthostShell;
+        public final String localOsType;
+        public final String localTimezone;
+        public final String homeDirectory;
+        public final List<String> workspaceUris;
+        public final String cursorVersion;
+
+        public EnvironmentContext(String exthostPlatform,
+                                  String exthostRelease,
+                                  String exthostShell,
+                                  String localOsType,
+                                  String localTimezone,
+                                  String homeDirectory,
+                                  List<String> workspaceUris,
+                                  String cursorVersion) {
+            this.exthostPlatform = exthostPlatform;
+            this.exthostRelease = exthostRelease;
+            this.exthostShell = exthostShell;
+            this.localOsType = localOsType;
+            this.localTimezone = localTimezone;
+            this.homeDirectory = homeDirectory;
+            this.workspaceUris = workspaceUris == null
+                    ? Collections.<String>emptyList()
+                    : new ArrayList<String>(workspaceUris);
+            this.cursorVersion = cursorVersion;
+        }
+    }
+
+    public static final class UnifiedChatBridgeContext {
+        public final String extraSystemPrompt;
+        public final int unifiedMode;
+        public final String unifiedModeName;
+        public final boolean disableTools;
+        public final boolean usesRules;
+        public final boolean supportsMermaidDiagrams;
+        public final boolean hasMcpDescriptors;
+        public final String terminalsFolder;
+        public final String agentTranscriptsFolder;
+        public final String customPlanningInstructions;
+        public final List<Integer> supportedTools;
+        public final List<UnifiedChatTool> mcpTools;
+        public final List<WorkspaceFolderContext> workspaceFolders;
+        public final EnvironmentContext environment;
+
+        public UnifiedChatBridgeContext(String extraSystemPrompt,
+                                        int unifiedMode,
+                                        String unifiedModeName,
+                                        boolean disableTools,
+                                        boolean usesRules,
+                                        boolean supportsMermaidDiagrams,
+                                        boolean hasMcpDescriptors,
+                                        String terminalsFolder,
+                                        String agentTranscriptsFolder,
+                                        String customPlanningInstructions,
+                                        List<Integer> supportedTools,
+                                        List<UnifiedChatTool> mcpTools,
+                                        List<WorkspaceFolderContext> workspaceFolders,
+                                        EnvironmentContext environment) {
+            this.extraSystemPrompt = extraSystemPrompt;
+            this.unifiedMode = unifiedMode;
+            this.unifiedModeName = unifiedModeName;
+            this.disableTools = disableTools;
+            this.usesRules = usesRules;
+            this.supportsMermaidDiagrams = supportsMermaidDiagrams;
+            this.hasMcpDescriptors = hasMcpDescriptors;
+            this.terminalsFolder = terminalsFolder;
+            this.agentTranscriptsFolder = agentTranscriptsFolder;
+            this.customPlanningInstructions = customPlanningInstructions;
+            this.supportedTools = supportedTools == null
+                    ? Collections.<Integer>emptyList()
+                    : new ArrayList<Integer>(supportedTools);
+            this.mcpTools = mcpTools == null
+                    ? Collections.<UnifiedChatTool>emptyList()
+                    : new ArrayList<UnifiedChatTool>(mcpTools);
+            this.workspaceFolders = workspaceFolders == null
+                    ? Collections.<WorkspaceFolderContext>emptyList()
+                    : new ArrayList<WorkspaceFolderContext>(workspaceFolders);
+            this.environment = environment;
+        }
+
+        public static UnifiedChatBridgeContext ask(String extraSystemPrompt) {
+            return new UnifiedChatBridgeContext(
+                    extraSystemPrompt,
+                    UNIFIED_MODE_CHAT,
+                    "Agent",
+                    true,
+                    extraSystemPrompt != null && !extraSystemPrompt.trim().isEmpty(),
+                    false,
+                    false,
+                    null,
+                    null,
+                    null,
+                    Collections.<Integer>emptyList(),
+                    Collections.<UnifiedChatTool>emptyList(),
+                    Collections.<WorkspaceFolderContext>emptyList(),
+                    null);
+        }
+
+        public static int modeFromName(String modeName) {
+            if (modeName == null) {
+                return UNIFIED_MODE_CHAT;
+            }
+            String normalized = modeName.trim().toLowerCase();
+            if ("agent".equals(normalized) || "project".equals(normalized) || "triage".equals(normalized)) {
+                return UNIFIED_MODE_AGENT;
+            }
+            if ("plan".equals(normalized)) {
+                return UNIFIED_MODE_PLAN;
+            }
+            if ("debug".equals(normalized)) {
+                return UNIFIED_MODE_DEBUG;
+            }
+            return UNIFIED_MODE_CHAT;
         }
     }
 
@@ -141,7 +287,10 @@ public final class CursorConnectUpstreamCodec {
      * 单条用户消息的 Connect 帧（与 CursorChatUtil.chatStream 一致：未压缩 protobuf + 5 字节头）。
      */
     public static byte[] buildFramedUnifiedChatBody(String model, String userText) throws IOException {
-        byte[] protobufBody = buildChatRequestProtobuf(model, Message.ofUser(userText != null ? userText : ""));
+        byte[] protobufBody = buildChatRequestProtobuf(
+                model,
+                Message.ofUser(userText != null ? userText : ""),
+                UnifiedChatBridgeContext.ask(null));
         return wrapGrpcFrame(protobufBody, false);
     }
 
@@ -149,7 +298,19 @@ public final class CursorConnectUpstreamCodec {
             throws IOException {
         byte[] protobufBody = buildChatRequestProtobuf(
                 model,
-                Message.of(extraSystemPrompt, userText != null ? userText : ""));
+                Message.ofUser(userText != null ? userText : ""),
+                UnifiedChatBridgeContext.ask(extraSystemPrompt));
+        return wrapGrpcFrame(protobufBody, false);
+    }
+
+    public static byte[] buildFramedUnifiedChatBody(String model,
+                                                    String userText,
+                                                    UnifiedChatBridgeContext bridgeContext)
+            throws IOException {
+        byte[] protobufBody = buildChatRequestProtobuf(
+                model,
+                Message.ofUser(userText != null ? userText : ""),
+                bridgeContext);
         return wrapGrpcFrame(protobufBody, false);
     }
 
@@ -157,6 +318,14 @@ public final class CursorConnectUpstreamCodec {
      * 构建 StreamUnifiedChatRequestWithTools 外层 protobuf（与 CursorChatUtil 一致）。
      */
     public static byte[] buildChatRequestProtobuf(String model, List<? extends Message> messages) throws IOException {
+        return buildChatRequestProtobuf(model, messages, UnifiedChatBridgeContext.ask(null));
+    }
+
+    public static byte[] buildChatRequestProtobuf(String model,
+                                                  List<? extends Message> messages,
+                                                  UnifiedChatBridgeContext bridgeContext) throws IOException {
+        UnifiedChatBridgeContext effectiveContext =
+                bridgeContext == null ? UnifiedChatBridgeContext.ask(null) : bridgeContext;
         StringBuilder systemPrompt = new StringBuilder();
         List<Message> conversationMessages = new ArrayList<>();
 
@@ -173,6 +342,13 @@ public final class CursorConnectUpstreamCodec {
 
         if (conversationMessages.isEmpty()) {
             conversationMessages.add(Message.user(""));
+        }
+
+        if (effectiveContext.extraSystemPrompt != null && !effectiveContext.extraSystemPrompt.trim().isEmpty()) {
+            if (systemPrompt.length() > 0) {
+                systemPrompt.append("\n\n");
+            }
+            systemPrompt.append(effectiveContext.extraSystemPrompt.trim());
         }
 
         String conversationId = "zmgnb";
@@ -215,13 +391,46 @@ public final class CursorConnectUpstreamCodec {
         writeBool(requestBuf, 22, true);
         writeString(requestBuf, 23, conversationId);
 
-        byte[] envInfo = buildEnvironmentInfo();
+        byte[] envInfo = buildEnvironmentInfo(effectiveContext.environment);
         writeBytes(requestBuf, 26, envInfo);
 
         writeBool(requestBuf, 37, false);
-        writeEnum(requestBuf, 46, UNIFIED_MODE_CHAT);
-        writeBool(requestBuf, 48, true);
-        writeString(requestBuf, 54, "Ask");
+        for (Integer supportedTool : effectiveContext.supportedTools) {
+            if (supportedTool != null) {
+                writeEnum(requestBuf, 29, supportedTool.intValue());
+            }
+        }
+        for (UnifiedChatTool tool : effectiveContext.mcpTools) {
+            byte[] mcpTool = buildMcpTool(tool);
+            if (mcpTool.length > 0) {
+                writeBytes(requestBuf, 34, mcpTool);
+            }
+        }
+        writeEnum(requestBuf, 46, effectiveContext.unifiedMode);
+        writeBool(requestBuf, 48, effectiveContext.disableTools);
+        writeBool(requestBuf, 51, effectiveContext.usesRules);
+        writeString(requestBuf, 54, firstNonBlank(effectiveContext.unifiedModeName, "Ask"));
+        writeBool(requestBuf, 65, effectiveContext.supportsMermaidDiagrams);
+        for (WorkspaceFolderContext folder : effectiveContext.workspaceFolders) {
+            byte[] workspaceFolder = buildWorkspaceFolder(folder);
+            if (workspaceFolder.length > 0) {
+                writeBytes(requestBuf, 81, workspaceFolder);
+            }
+        }
+        if (effectiveContext.customPlanningInstructions != null
+                && !effectiveContext.customPlanningInstructions.trim().isEmpty()) {
+            writeString(requestBuf, 84, effectiveContext.customPlanningInstructions.trim());
+        }
+        if (effectiveContext.terminalsFolder != null && !effectiveContext.terminalsFolder.trim().isEmpty()) {
+            writeString(requestBuf, 86, effectiveContext.terminalsFolder.trim());
+        }
+        if (effectiveContext.hasMcpDescriptors) {
+            writeBool(requestBuf, 90, true);
+        }
+        if (effectiveContext.agentTranscriptsFolder != null
+                && !effectiveContext.agentTranscriptsFolder.trim().isEmpty()) {
+            writeString(requestBuf, 93, effectiveContext.agentTranscriptsFolder.trim());
+        }
 
         byte[] streamUnifiedChatRequest = requestBuf.toByteArray();
 
@@ -371,18 +580,65 @@ public final class CursorConnectUpstreamCodec {
         return buf.toByteArray();
     }
 
-    private static byte[] buildEnvironmentInfo() throws IOException {
+    private static byte[] buildEnvironmentInfo(EnvironmentContext environment) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream(64);
-        writeString(buf, 1, "win32");
+        EnvironmentContext effectiveEnvironment = environment == null
+                ? new EnvironmentContext(
+                        "win32",
+                        null,
+                        null,
+                        "Windows",
+                        null,
+                        null,
+                        Collections.<String>emptyList(),
+                        CLIENT_VERSION)
+                : environment;
+        writeString(buf, 1, firstNonBlank(effectiveEnvironment.exthostPlatform, "win32"));
+        writeString(buf, 3, firstNonBlank(effectiveEnvironment.exthostRelease, ""));
+        writeString(buf, 4, firstNonBlank(effectiveEnvironment.exthostShell, ""));
         String timestamp = LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME);
         writeString(buf, 5, timestamp);
-        short[] vp = parseSemverParts(CLIENT_VERSION);
-        byte[] versionBytes = new byte[6];
-        ByteBuffer.wrap(versionBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                .putShort(vp[0])
-                .putShort(vp[1])
-                .putShort(vp[2]);
-        writeBytesField(buf, 7, versionBytes);
+        for (String workspaceUri : effectiveEnvironment.workspaceUris) {
+            if (workspaceUri != null && !workspaceUri.trim().isEmpty()) {
+                writeString(buf, 6, workspaceUri.trim());
+            }
+        }
+        writeString(buf, 7, firstNonBlank(effectiveEnvironment.cursorVersion, CLIENT_VERSION));
+        writeString(buf, 9, firstNonBlank(effectiveEnvironment.localOsType, ""));
+        writeString(buf, 10, firstNonBlank(effectiveEnvironment.homeDirectory, ""));
+        writeString(buf, 11, firstNonBlank(effectiveEnvironment.localTimezone, ""));
+        return buf.toByteArray();
+    }
+
+    private static byte[] buildMcpTool(UnifiedChatTool tool) throws IOException {
+        if (tool == null) {
+            return new byte[0];
+        }
+        ByteArrayOutputStream buf = new ByteArrayOutputStream(128);
+        if (tool.name != null && !tool.name.trim().isEmpty()) {
+            writeString(buf, 1, tool.name.trim());
+        }
+        if (tool.description != null && !tool.description.trim().isEmpty()) {
+            writeString(buf, 2, tool.description.trim());
+        }
+        writeString(buf, 3, firstNonBlank(tool.parameters, "{}"));
+        if (tool.serverName != null && !tool.serverName.trim().isEmpty()) {
+            writeString(buf, 4, tool.serverName.trim());
+        }
+        return buf.toByteArray();
+    }
+
+    private static byte[] buildWorkspaceFolder(WorkspaceFolderContext folder) throws IOException {
+        if (folder == null) {
+            return new byte[0];
+        }
+        ByteArrayOutputStream buf = new ByteArrayOutputStream(96);
+        if (folder.uri != null && !folder.uri.trim().isEmpty()) {
+            writeString(buf, 1, folder.uri.trim());
+        }
+        if (folder.name != null && !folder.name.trim().isEmpty()) {
+            writeString(buf, 2, folder.name.trim());
+        }
         return buf.toByteArray();
     }
 
@@ -403,6 +659,21 @@ public final class CursorConnectUpstreamCodec {
         } catch (NumberFormatException e) {
             return def;
         }
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null) {
+            return null;
+        }
+        for (String value : values) {
+            if (value != null) {
+                String trimmed = value.trim();
+                if (!trimmed.isEmpty()) {
+                    return trimmed;
+                }
+            }
+        }
+        return null;
     }
 
     private static void writeVarint(ByteArrayOutputStream os, int value) throws IOException {

@@ -1,6 +1,13 @@
 package com.github.monkeywie.proxyee;
 
+import com.github.monkeywie.proxyee.intercept.HttpProxyInterceptInitializer;
+import com.github.monkeywie.proxyee.intercept.HttpProxyInterceptPipeline;
+import com.github.monkeywie.proxyee.intercept.common.CertDownIntercept;
 import com.github.monkeywie.proxyee.intercept.cursor.CursorHttp2StreamAbortIntercept;
+import com.github.monkeywie.proxyee.intercept.cursor.CursorStreamAbortIntercept;
+import com.github.monkeywie.proxyee.intercept.cursor.CursorStreamAbortIntercept2;
+import com.github.monkeywie.proxyee.server.HttpProxyServer;
+import com.github.monkeywie.proxyee.server.HttpProxyServerConfig;
 
 import java.util.logging.Logger;
 
@@ -18,21 +25,41 @@ public class HttpProxyServerApp {
     private static final Logger LOG = Logger.getLogger(HttpProxyServerApp.class.getName());
 
     public static void main(String[] args) throws Exception {
+//        int port = 8080;
+//        if (args.length > 0) {
+//            port = Integer.parseInt(args[0]);
+//        }
+//
+//        CursorHttp2StreamAbortIntercept.setForceRunSseUnifiedChatBridge(true);
+//
+//        CursorHttp2StreamAbortIntercept h2Server = new CursorHttp2StreamAbortIntercept(
+//                CursorHttp2StreamAbortIntercept.DEFAULT_ABORT_TOKEN,
+//                null /* 如需修改头，传入 headers -> headers.set("x-foo", "bar") */
+//        );
+//        h2Server.start(port);
+//        LOG.info("[H2Proxy] MITM proxy started on port " + port + ", waiting for Cursor IDE requests...");
+//
+//        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+//            LOG.info("[H2Proxy] shutting down...");
+//            h2Server.stop();
+//        }));
+
+        System.out.println("start proxy server (MITM + CursorStreamAbort)");
         int port = 8080;
         if (args.length > 0) {
-            port = Integer.parseInt(args[0]);
+            port = Integer.valueOf(args[0]);
         }
-
-        CursorHttp2StreamAbortIntercept h2Server = new CursorHttp2StreamAbortIntercept(
-                CursorHttp2StreamAbortIntercept.DEFAULT_ABORT_TOKEN,
-                null /* 如需修改头，传入 headers -> headers.set("x-foo", "bar") */
-        );
-        h2Server.start(port);
-        LOG.info("[H2Proxy] MITM proxy started on port " + port + ", waiting for Cursor IDE requests...");
-
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            LOG.info("[H2Proxy] shutting down...");
-            h2Server.stop();
-        }));
+        HttpProxyServerConfig config = new HttpProxyServerConfig();
+        config.setHandleSsl(true);
+        new HttpProxyServer()
+                .serverConfig(config)
+                .proxyInterceptInitializer(new HttpProxyInterceptInitializer() {
+                    @Override
+                    public void init(HttpProxyInterceptPipeline pipeline) {
+                        pipeline.addLast(new CertDownIntercept());
+                        pipeline.addLast(new CursorStreamAbortIntercept2());
+                    }
+                })
+                .start(port);
     }
 }

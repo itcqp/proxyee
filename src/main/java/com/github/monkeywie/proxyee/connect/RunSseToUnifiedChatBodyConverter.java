@@ -142,7 +142,7 @@ public final class RunSseToUnifiedChatBodyConverter {
     /**
      * 从首帧 Connect payload（可能 gzip）中启发式提取用户可见文本，失败则返回空串。
      */
-    static String extractPromptGuess(byte[] fullBody) {
+   public static String extractPromptGuess(byte[] fullBody) {
         if (fullBody == null || fullBody.length < 5) {
             return "";
         }

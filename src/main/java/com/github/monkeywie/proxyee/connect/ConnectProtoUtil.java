@@ -8,8 +8,6 @@ import java.util.Arrays;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
-import static com.github.monkeywie.proxyee.intercept.cursor.CursorHttp2StreamAbortIntercept.firstNonBlank;
-
 /**
  * gRPC Connect 流式响应与 Cursor StreamUnifiedChat protobuf 的公共解析工具。
  */
@@ -470,6 +468,116 @@ public final class ConnectProtoUtil {
         }
     }
 
+    public static String extractVisibleTextFromAgentServerMessage(byte[] data) {
+        if (data == null || data.length == 0) {
+            return null;
+        }
+        try {
+            byte[] interaction = extractLengthDelimitedFieldPayload(data, 1);
+            if (interaction == null || interaction.length == 0) {
+                return null;
+            }
+            byte[] textDelta = extractLengthDelimitedFieldPayload(interaction, 1);
+            if (textDelta == null || textDelta.length == 0) {
+                return null;
+            }
+            return extractDelimitedStringField(textDelta, 1);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    public static String extractThinkingTextFromAgentServerMessage(byte[] data) {
+        if (data == null || data.length == 0) {
+            return null;
+        }
+        try {
+            byte[] interaction = extractLengthDelimitedFieldPayload(data, 1);
+            if (interaction == null || interaction.length == 0) {
+                return null;
+            }
+            byte[] thinkingDelta = extractLengthDelimitedFieldPayload(interaction, 4);
+            if (thinkingDelta == null || thinkingDelta.length == 0) {
+                return null;
+            }
+            return extractDelimitedStringField(thinkingDelta, 1);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    public static String describeAgentServerMessageKind(byte[] data) {
+        if (data == null || data.length == 0) {
+            return "empty";
+        }
+        try {
+            int pos = 0;
+            while (pos < data.length) {
+                int[] tagResult = readTag(data, pos);
+                int fieldNumber = tagResult[0];
+                int wireType = tagResult[1];
+                pos = tagResult[2];
+                if (wireType == WIRE_TYPE_LENGTH_DELIMITED) {
+                    int[] lenResult = readVarint(data, pos);
+                    int len = lenResult[0];
+                    pos = lenResult[1];
+                    if (len < 0 || pos + len > data.length) {
+                        return "malformed";
+                    }
+                    byte[] chunk = Arrays.copyOfRange(data, pos, pos + len);
+                    switch (fieldNumber) {
+                        case 1:
+                            return "interaction_update:" + describeInteractionUpdateKind(chunk);
+                        case 2:
+                            return "exec_server_message";
+                        case 3:
+                            return "conversation_checkpoint_update";
+                        case 4:
+                            return "kv_server_message";
+                        case 5:
+                            return "exec_server_control_message";
+                        case 7:
+                            return "interaction_query";
+                        default:
+                            return "top_level_field_" + fieldNumber;
+                    }
+                } else if (wireType == WIRE_TYPE_VARINT) {
+                    int[] varintResult = readVarint(data, pos);
+                    pos = varintResult[1];
+                } else if (wireType == WIRE_TYPE_FIXED64) {
+                    pos += 8;
+                } else if (wireType == WIRE_TYPE_FIXED32) {
+                    pos += 4;
+                } else {
+                    return "unknown_wire_type_" + wireType;
+                }
+            }
+        } catch (Exception ignored) {
+            return "parse_error";
+        }
+        return "no_message";
+    }
+
+    public static String describeRoleContextBeforeNeedle(byte[] utf8PrefixBeforeNeedle) {
+        if (utf8PrefixBeforeNeedle == null || utf8PrefixBeforeNeedle.length == 0) {
+            return "empty_prefix";
+        }
+        try {
+            String s = new String(utf8PrefixBeforeNeedle, StandardCharsets.UTF_8);
+            int u = s.lastIndexOf("\"role\":\"user\"");
+            int a = s.lastIndexOf("\"role\":\"assistant\"");
+            int sys = s.lastIndexOf("\"role\":\"system\"");
+            int max = Math.max(Math.max(u, a), sys);
+            return "u=" + u
+                    + ",a=" + a
+                    + ",sys=" + sys
+                    + ",hasRole=" + (max >= 0)
+                    + ",assistantDecision=" + (max >= 0 && max == a);
+        } catch (Exception ignored) {
+            return "role_scan_error";
+        }
+    }
+
     /**
      * 用于调试桥接流：快速标记当前 UnifiedChat 帧属于文本、工具调用、thinking 还是其它事件。
      */
@@ -535,6 +643,10 @@ public final class ConnectProtoUtil {
             return null;
         }
         try {
+            byte[] clientSideToolCall = extractLengthDelimitedFieldPayload(data, 1);
+            if (clientSideToolCall != null && clientSideToolCall.length > 0) {
+                return summarizeClientSideToolV2Call(clientSideToolCall, "client_side_tool_v2_call");
+            }
             byte[] unified = extractLengthDelimitedFieldPayload(data, 2);
             if (unified == null || unified.length == 0) {
                 return null;
@@ -581,6 +693,149 @@ public final class ConnectProtoUtil {
             return sb.toString();
         } catch (Exception ignored) {
             return null;
+        }
+    }
+
+    private static String summarizeClientSideToolV2Call(byte[] toolCall, String source) {
+        if (toolCall == null || toolCall.length == 0) {
+            return null;
+        }
+        String toolEnum = extractVarintFieldAsString(toolCall, 1);
+        String toolCallId = extractDelimitedStringField(toolCall, 3);
+        String name = extractDelimitedStringField(toolCall, 9);
+        String rawArgs = extractDelimitedStringField(toolCall, 10);
+        String modelCallId = extractDelimitedStringField(toolCall, 49);
+        String paramsField = describeClientSideToolParamsField(toolCall);
+        StringBuilder sb = new StringBuilder();
+        sb.append(source);
+        if (name != null && !name.isEmpty()) {
+            sb.append(":name=").append(name);
+        }
+        if (toolEnum != null && !toolEnum.isEmpty()) {
+            sb.append(",tool=").append(toolEnum);
+        }
+        if (toolCallId != null && !toolCallId.isEmpty()) {
+            sb.append(",callId=").append(toolCallId);
+        }
+        if (modelCallId != null && !modelCallId.isEmpty()) {
+            sb.append(",modelCallId=").append(modelCallId);
+        }
+        if (paramsField != null && !paramsField.isEmpty()) {
+            sb.append(",params=").append(paramsField);
+        }
+        if (rawArgs != null && !rawArgs.isEmpty()) {
+            sb.append(",rawArgs=").append(rawArgs);
+        }
+        return sb.toString();
+    }
+
+    private static String describeClientSideToolParamsField(byte[] toolCall) {
+        if (toolCall == null || toolCall.length == 0) {
+            return null;
+        }
+        try {
+            int pos = 0;
+            while (pos < toolCall.length) {
+                int[] tagResult = readTag(toolCall, pos);
+                int fieldNumber = tagResult[0];
+                int wireType = tagResult[1];
+                pos = tagResult[2];
+                if (wireType == WIRE_TYPE_LENGTH_DELIMITED) {
+                    int[] lenResult = readVarint(toolCall, pos);
+                    int len = lenResult[0];
+                    pos = lenResult[1];
+                    if (len < 0 || pos + len > toolCall.length) {
+                        return null;
+                    }
+                    if (fieldNumber != 3
+                            && fieldNumber != 9
+                            && fieldNumber != 10
+                            && fieldNumber != 49) {
+                        return clientSideToolParamsFieldName(fieldNumber);
+                    }
+                    pos += len;
+                } else if (wireType == WIRE_TYPE_VARINT) {
+                    int[] varintResult = readVarint(toolCall, pos);
+                    pos = varintResult[1];
+                } else if (wireType == WIRE_TYPE_FIXED64) {
+                    pos += 8;
+                } else if (wireType == WIRE_TYPE_FIXED32) {
+                    pos += 4;
+                } else {
+                    return null;
+                }
+                if (pos < 0 || pos > toolCall.length) {
+                    return null;
+                }
+            }
+        } catch (Exception ignored) {
+            return null;
+        }
+        return null;
+    }
+
+    private static String clientSideToolParamsFieldName(int fieldNumber) {
+        switch (fieldNumber) {
+            case 2:
+                return "read_semsearch_files_params";
+            case 5:
+                return "ripgrep_search_params";
+            case 8:
+                return "read_file_params";
+            case 12:
+                return "list_dir_params";
+            case 23:
+                return "run_terminal_command_v2_params";
+            case 24:
+                return "fetch_rules_params";
+            case 26:
+                return "web_search_params";
+            case 27:
+                return "mcp_params";
+            case 37:
+                return "fix_lints_params";
+            case 38:
+                return "read_lints_params";
+            case 42:
+                return "task_params";
+            case 43:
+                return "await_task_params";
+            case 44:
+                return "todo_read_params";
+            case 45:
+                return "todo_write_params";
+            case 50:
+                return "edit_file_v2_params";
+            case 52:
+                return "list_dir_v2_params";
+            case 53:
+                return "read_file_v2_params";
+            case 54:
+                return "ripgrep_raw_search_params";
+            case 55:
+                return "glob_file_search_params";
+            case 57:
+                return "list_mcp_resources_params";
+            case 58:
+                return "read_mcp_resource_params";
+            case 61:
+                return "task_v2_params";
+            case 62:
+                return "call_mcp_tool_params";
+            case 64:
+                return "ask_question_params";
+            case 65:
+                return "switch_mode_params";
+            case 66:
+                return "computer_use_params";
+            case 67:
+                return "write_shell_stdin_params";
+            case 69:
+                return "web_fetch_params";
+            case 70:
+                return "report_bugfix_results_params";
+            default:
+                return "field_" + fieldNumber;
         }
     }
 
@@ -703,6 +958,73 @@ public final class ConnectProtoUtil {
         return "no_text";
     }
 
+    private static String describeInteractionUpdateKind(byte[] data) {
+        if (data == null || data.length == 0) {
+            return "empty";
+        }
+        try {
+            int pos = 0;
+            while (pos < data.length) {
+                int[] tagResult = readTag(data, pos);
+                int fieldNumber = tagResult[0];
+                int wireType = tagResult[1];
+                pos = tagResult[2];
+                if (wireType == WIRE_TYPE_LENGTH_DELIMITED) {
+                    int[] lenResult = readVarint(data, pos);
+                    int len = lenResult[0];
+                    pos = lenResult[1];
+                    if (len < 0 || pos + len > data.length) {
+                        return "malformed";
+                    }
+                    switch (fieldNumber) {
+                        case 1:
+                            return "text_delta";
+                        case 2:
+                            return "tool_call_started";
+                        case 3:
+                            return "tool_call_completed";
+                        case 4:
+                            return "thinking_delta";
+                        case 6:
+                            return "user_message_appended";
+                        case 7:
+                            return "partial_tool_call";
+                        case 9:
+                            return "summary";
+                        case 10:
+                            return "summary_started";
+                        case 11:
+                            return "summary_completed";
+                        case 12:
+                            return "shell_output_delta";
+                        case 14:
+                            return "turn_ended";
+                        case 15:
+                            return "tool_call_delta";
+                        case 16:
+                            return "step_started";
+                        case 17:
+                            return "step_completed";
+                        default:
+                            return "interaction_field_" + fieldNumber;
+                    }
+                } else if (wireType == WIRE_TYPE_VARINT) {
+                    int[] varintResult = readVarint(data, pos);
+                    pos = varintResult[1];
+                } else if (wireType == WIRE_TYPE_FIXED64) {
+                    pos += 8;
+                } else if (wireType == WIRE_TYPE_FIXED32) {
+                    pos += 4;
+                } else {
+                    return "unknown_wire_type_" + wireType;
+                }
+            }
+        } catch (Exception ignored) {
+            return "parse_error";
+        }
+        return "no_interaction_message";
+    }
+
     private static String extractVarintFieldAsString(byte[] data, int targetFieldNumber) {
         if (data == null || data.length == 0) {
             return null;
@@ -767,6 +1089,21 @@ public final class ConnectProtoUtil {
                 pos += 4;
             } else {
                 return null;
+            }
+        }
+        return null;
+    }
+
+    private static String firstNonBlank(String... values) {
+        if (values == null) {
+            return null;
+        }
+        for (String value : values) {
+            if (value != null) {
+                String trimmed = value.trim();
+                if (!trimmed.isEmpty()) {
+                    return trimmed;
+                }
             }
         }
         return null;
@@ -947,7 +1284,7 @@ public final class ConnectProtoUtil {
      */
     public static boolean lastRoleBeforeNeedleIsAssistant(byte[] utf8PrefixBeforeNeedle) {
         if (utf8PrefixBeforeNeedle == null || utf8PrefixBeforeNeedle.length == 0) {
-            return true;
+            return false;
         }
         String s = new String(utf8PrefixBeforeNeedle, StandardCharsets.UTF_8);
         int u = s.lastIndexOf("\"role\":\"user\"");
@@ -955,7 +1292,7 @@ public final class ConnectProtoUtil {
         int sys = s.lastIndexOf("\"role\":\"system\"");
         int max = Math.max(Math.max(u, a), sys);
         if (max < 0) {
-            return true;
+            return false;
         }
         return max == a;
     }

@@ -66,9 +66,11 @@ import io.netty.util.ReferenceCountUtil;
 public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
 
     private static final Logger LOG = Logger.getLogger(CursorHttp2StreamAbortIntercept.class.getName());
-    private static final String DEBUG_LOG_PATH = "d:/devin/playgame/proxyee63/debug-064e27.log";
-    private static final String DEBUG_RUNTIME_LOG_PATH = "D:/devin/playgame/proxyee63/debug-e2f75a.log";
-    private static final String DEBUG_RUNTIME_SESSION_ID = "e2f75a";
+    private static final String DEBUG_LOG_PATH = "D:/devin/playgame/proxyee63/debug-71426e.log";
+    private static final String DEBUG_RUNTIME_LOG_PATH = "D:/devin/playgame/proxyee63/debug-71426e.log";
+    private static final String DEBUG_RUNTIME_SESSION_ID = "71426e";
+    private static final String DEBUG_SESSION_LOG_PATH = "D:/devin/playgame/proxyee63/debug-71426e.log";
+    private static final String DEBUG_SESSION_ID = "71426e";
     private static final int MAX_FULL_REQUEST_BYTES = 16 * 1024 * 1024;
     private static final String AGGREGATOR_NAME = "cursorProxyAggregator";
     private static final String UNIFIED_CHAT_UPSTREAM_URL =
@@ -83,10 +85,13 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             new ConcurrentHashMap<String, String>();
     private static final ConcurrentHashMap<String, String> REQUEST_PROMPT_CACHE =
             new ConcurrentHashMap<String, String>();
-    private static final ConcurrentHashMap<String, String> SESSION_RULES_CACHE =
-            new ConcurrentHashMap<String, String>();
-    private static final ConcurrentHashMap<String, String> REQUEST_RULES_CACHE =
-            new ConcurrentHashMap<String, String>();
+    private static final ConcurrentHashMap<String, BridgedRunContext> SESSION_BRIDGED_CONTEXT_CACHE =
+            new ConcurrentHashMap<String, BridgedRunContext>();
+    private static final ConcurrentHashMap<String, BridgedRunContext> REQUEST_BRIDGED_CONTEXT_CACHE =
+            new ConcurrentHashMap<String, BridgedRunContext>();
+    private static final ConcurrentHashMap<String, BidiAbortControl> REQUEST_BIDI_ABORT_CACHE =
+            new ConcurrentHashMap<String, BidiAbortControl>();
+    private static volatile boolean FORCE_RUNSSE_UNIFIED_CHAT_BRIDGE = false;
 
     public static final String DEFAULT_ABORT_TOKEN = "zmgnb666";
 
@@ -106,6 +111,10 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                 .readTimeout(180, TimeUnit.SECONDS)
                 .writeTimeout(30, TimeUnit.SECONDS)
                 .build();
+    }
+
+    public static void setForceRunSseUnifiedChatBridge(boolean enabled) {
+        FORCE_RUNSSE_UNIFIED_CHAT_BRIDGE = enabled;
     }
 
     public void start(int port) {
@@ -243,10 +252,27 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
 
                 @Override
                 public void onFailure(Call call, IOException e) {
+                    String runId = debugRunId(request.headers, extractRequestIdFromRunSseBody(request.body));
                     dl("OkHttp.onFailure", "UPSTREAM_FAILED",
                             "{\"error\":\"" + esc(e.getClass().getSimpleName() + ": " + e.getMessage())
                                     + "\",\"canceled\":" + call.isCanceled() + "}");
+                    // #region agent log
+                    dbg(runId, "H13",
+                            "CursorHttp2StreamAbortIntercept.executeInterceptedRequest.onFailure",
+                            "upstream_on_failure",
+                            "{\"path\":\"" + esc(request.normalizedPath)
+                                    + "\",\"routeKind\":\"" + esc(String.valueOf(request.routeKind))
+                                    + "\",\"canceled\":" + call.isCanceled()
+                                    + ",\"error\":\""
+                                    + esc(e.getClass().getSimpleName() + ": " + e.getMessage()) + "\"}");
+                    // #endregion
                     if (call.isCanceled()) {
+                        // #region agent log
+                        dbg(runId, "H13",
+                                "CursorHttp2StreamAbortIntercept.executeInterceptedRequest.onFailure",
+                                "upstream_canceled_failure_completes_gate",
+                                "{\"path\":\"" + esc(request.normalizedPath) + "\"}");
+                        // #endregion
                         completeCurrentResponse(clientChannel);
                         return;
                     }
@@ -338,7 +364,7 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             if (request.routeKind == RouteKind.BRIDGE_TO_UNIFIED_CHAT) {
                 streamUnifiedChatAsAgentRunSse(call, body, clientChannel, request.keepAlive);
             } else if (request.abortAware) {
-                streamWithAbortDetection(call, body, clientChannel, request.keepAlive);
+                streamWithAbortDetection(call, body, clientChannel, request);
             } else {
                 streamRawBody(body, clientChannel, request.keepAlive);
             }
@@ -520,6 +546,33 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                         // #endregion
                         responseKindLogs++;
                     }
+                    if ("client_side_tool_v2_call".equals(responseKind)
+                            || responseKind.contains("tool_call")
+                            || responseKind.contains("final_tool_result")) {
+                        // #region agent log
+                        dbg("bridge-stream", "H_TOOL",
+                                "CursorHttp2StreamAbortIntercept.streamUnifiedChatAsAgentRunSse",
+                                "bridge_tool_event_seen_but_not_forwarded",
+                                "{\"frameIdx\":" + frameIdx
+                                        + ",\"kind\":\"" + esc(responseKind)
+                                        + "\",\"payloadLen\":" + effectivePayload.length + "}");
+                        // #endregion
+                        // #region agent log
+                        dbg("bridge-stream", "H18",
+                                "CursorHttp2StreamAbortIntercept.streamUnifiedChatAsAgentRunSse",
+                                "bridge_tool_event_detail",
+                                "{\"frameIdx\":" + frameIdx
+                                        + ",\"kind\":\"" + esc(responseKind)
+                                        + "\",\"toolSummary\":\""
+                                        + esc(oneLinePreview(
+                                        ConnectProtoUtil.extractUnifiedChatToolCallSummary(effectivePayload), 260))
+                                        + "\",\"topLevelClientTool\":"
+                                        + "client_side_tool_v2_call".equals(responseKind)
+                                        + ",\"textPresent\":"
+                                        + (ConnectProtoUtil.extractVisibleTextFromUnifiedChatResponse(effectivePayload) != null)
+                                        + ",\"payloadLen\":" + effectivePayload.length + "}");
+                        // #endregion
+                    }
                     String rawText = ConnectProtoUtil.extractVisibleTextFromUnifiedChatResponse(effectivePayload);
                     String text = sanitizeAssistantText(rawText);
                     if (text != null && !text.isEmpty()) {
@@ -679,7 +732,13 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
     }
 
     private void streamWithAbortDetection(Call call, ResponseBody body,
-                                          Channel clientChannel, boolean keepAlive) {
+                                          Channel clientChannel, DownstreamRequest request) {
+        boolean keepAlive = request.keepAlive;
+        boolean emitRunSseTurnEnded = isRunSsePath(request.normalizedPath);
+        String abortToken = new String(abortTokenBytes, StandardCharsets.UTF_8);
+        String runId = debugRunId(
+                request.headers,
+                emitRunSseTurnEnded ? extractRequestIdFromRunSseBody(request.body) : null);
         try (InputStream is = body.byteStream();
              DataInputStream dis = new DataInputStream(new BufferedInputStream(is))) {
             int frameIdx = 0;
@@ -709,48 +768,141 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                     byte[] decompressed = compressed
                             ? ConnectProtoUtil.gzipDecompress(payload) : payload;
                     if (decompressed != null) {
-                        String text = ConnectProtoUtil.extractTextFromResponseLenient(decompressed);
-                        if (text != null && !text.isEmpty()) {
-                            String sanitized = sanitizeAssistantText(text);
-                            if (sanitized != null && !sanitized.isEmpty()) {
-                                if (assistantWindow.length() > 0 && assistantWindow.length() < 4096) {
-                                    assistantWindow.append('\n');
-                                }
-                                assistantWindow.append(sanitized);
-                                if (assistantWindow.length() > 4096) {
-                                    assistantWindow.delete(0, assistantWindow.length() - 4096);
-                                }
-                                assistantWindowNoSep.append(sanitized);
-                                if (assistantWindowNoSep.length() > 4096) {
-                                    assistantWindowNoSep.delete(0, assistantWindowNoSep.length() - 4096);
-                                }
-                                if (assistantWindow.indexOf(new String(abortTokenBytes, StandardCharsets.UTF_8)) >= 0) {
-                                    // #region agent log
-                                    dbg("abort-scan", "H8",
-                                            "CursorHttp2StreamAbortIntercept.streamWithAbortDetection",
-                                            "abort_token_seen_in_accumulated_window",
-                                            "{\"frameIdx\":" + frameIdx
-                                                    + ",\"windowPreview\":\""
-                                                    + esc(oneLinePreview(assistantWindow.toString(), 200)) + "\"}");
-                                    // #endregion
-                                }
-                                if (assistantWindowNoSep.indexOf(new String(abortTokenBytes, StandardCharsets.UTF_8)) >= 0) {
-                                    // #region agent log
-                                    dbg("abort-scan", "H8",
-                                            "CursorHttp2StreamAbortIntercept.streamWithAbortDetection",
-                                            "abort_token_seen_in_accumulated_window_no_sep",
-                                            "{\"frameIdx\":" + frameIdx
-                                                    + ",\"windowPreview\":\""
-                                                    + esc(oneLinePreview(assistantWindowNoSep.toString(), 200)) + "\"}");
-                                    // #endregion
-                                }
+                        String text = emitRunSseTurnEnded
+                                ? ConnectProtoUtil.extractVisibleTextFromAgentServerMessage(decompressed)
+                                : ConnectProtoUtil.extractTextFromResponseLenient(decompressed);
+                        String sanitizedText = sanitizeAssistantText(text);
+                        if (sanitizedText != null && !sanitizedText.isEmpty()) {
+                            if (assistantWindow.length() > 0 && assistantWindow.length() < 4096) {
+                                assistantWindow.append('\n');
+                            }
+                            assistantWindow.append(sanitizedText);
+                            if (assistantWindow.length() > 4096) {
+                                assistantWindow.delete(0, assistantWindow.length() - 4096);
+                            }
+                            assistantWindowNoSep.append(sanitizedText);
+                            if (assistantWindowNoSep.length() > 4096) {
+                                assistantWindowNoSep.delete(0, assistantWindowNoSep.length() - 4096);
+                            }
+                            if (assistantWindow.indexOf(abortToken) >= 0) {
+                                // #region agent log
+                                dbg("abort-scan", "H8",
+                                        "CursorHttp2StreamAbortIntercept.streamWithAbortDetection",
+                                        "abort_token_seen_in_accumulated_window",
+                                        "{\"frameIdx\":" + frameIdx
+                                                + ",\"windowPreview\":\""
+                                                + esc(oneLinePreview(assistantWindow.toString(), 200)) + "\"}");
+                                // #endregion
+                            }
+                            if (assistantWindowNoSep.indexOf(abortToken) >= 0) {
+                                // #region agent log
+                                dbg("abort-scan", "H8",
+                                        "CursorHttp2StreamAbortIntercept.streamWithAbortDetection",
+                                        "abort_token_seen_in_accumulated_window_no_sep",
+                                        "{\"frameIdx\":" + frameIdx
+                                                + ",\"windowPreview\":\""
+                                                + esc(oneLinePreview(assistantWindowNoSep.toString(), 200)) + "\"}");
+                                // #endregion
                             }
                             LOG.info("[H2Proxy] Frame#" + frameIdx
                                     + " text(" + text.length() + "): " + trunc(text, 300));
                         }
+
                         int needleIdx = ConnectProtoUtil.indexOfSubsequence(
                                 decompressed, abortTokenBytes);
-                        if (needleIdx >= 0) {
+                        if (emitRunSseTurnEnded) {
+                            String agentFrameKind =
+                                    ConnectProtoUtil.describeAgentServerMessageKind(decompressed);
+                            String agentVisibleText =
+                                    sanitizeAssistantText(
+                                            ConnectProtoUtil.extractVisibleTextFromAgentServerMessage(decompressed));
+                            String agentThinkingText =
+                                    sanitizeAssistantText(
+                                            ConnectProtoUtil.extractThinkingTextFromAgentServerMessage(decompressed));
+                            String roleContext = needleIdx >= 0
+                                    ? ConnectProtoUtil.describeRoleContextBeforeNeedle(
+                                    Arrays.copyOfRange(decompressed, 0, needleIdx))
+                                    : "needle_absent";
+                            if (needleIdx >= 0) {
+                                // #region agent log
+                                dbg(runId, "H15",
+                                        "CursorHttp2StreamAbortIntercept.streamWithAbortDetection",
+                                        "abort_runsse_frame_probe",
+                                        "{\"frameIdx\":" + frameIdx
+                                                + ",\"kind\":\"" + esc(agentFrameKind)
+                                                + "\",\"agentTextPreview\":\""
+                                                + esc(oneLinePreview(agentVisibleText, 180))
+                                                + "\",\"agentTextHasToken\":"
+                                                + (agentVisibleText != null && agentVisibleText.contains(abortToken))
+                                                + ",\"thinkingPreview\":\""
+                                                + esc(oneLinePreview(agentThinkingText, 180))
+                                                + "\",\"thinkingHasToken\":"
+                                                + (agentThinkingText != null && agentThinkingText.contains(abortToken))
+                                                + ",\"roleContext\":\"" + esc(roleContext) + "\"}");
+                                // #endregion
+                                if ((agentVisibleText == null || !agentVisibleText.contains(abortToken))
+                                        && (agentThinkingText == null || !agentThinkingText.contains(abortToken))) {
+                                    // #region agent log
+                                    dbg(runId, "H16",
+                                            "CursorHttp2StreamAbortIntercept.streamWithAbortDetection",
+                                            "abort_runsse_nonvisible_token_ignored",
+                                            "{\"frameIdx\":" + frameIdx
+                                                    + ",\"kind\":\"" + esc(agentFrameKind)
+                                                    + "\",\"roleContext\":\"" + esc(roleContext) + "\"}");
+                                    // #endregion
+                                }
+                            }
+                            if (sanitizedText != null && !sanitizedText.isEmpty()
+                                    && assistantWindowNoSep.indexOf(abortToken) >= 0) {
+                                String beforeToken = assistantWindowNoSep.substring(
+                                        0, assistantWindowNoSep.indexOf(abortToken));
+                                String currentPrefix = beforeToken.length() > 0
+                                        && beforeToken.length() >= sanitizedText.length()
+                                        ? beforeToken.substring(
+                                        Math.max(0, beforeToken.length() - sanitizedText.length()))
+                                        : beforeToken;
+                                String safeCurrent = sanitizedText;
+                                if (currentPrefix != null && !currentPrefix.isEmpty()
+                                        && safeCurrent.startsWith(currentPrefix)) {
+                                    safeCurrent = safeCurrent.substring(currentPrefix.length());
+                                }
+                                int abortInCurrent = safeCurrent.indexOf(abortToken);
+                                String forwardText = abortInCurrent >= 0
+                                        ? safeCurrent.substring(0, abortInCurrent)
+                                        : "";
+                                // #region agent log
+                                dbg(runId, "H16",
+                                        "CursorHttp2StreamAbortIntercept.streamWithAbortDetection",
+                                        "abort_runsse_visible_text_detected",
+                                        "{\"frameIdx\":" + frameIdx
+                                                + ",\"kind\":\"" + esc(agentFrameKind)
+                                                + "\",\"forwardTextPreview\":\""
+                                                + esc(oneLinePreview(forwardText, 120)) + "\"}");
+                                // #endregion
+                                if (!forwardText.isEmpty()) {
+                                    writeConnectFrame(clientChannel, buildAgentTextDeltaFrame(forwardText));
+                                }
+                                dbg(runId, "H10",
+                                        "CursorHttp2StreamAbortIntercept.streamWithAbortDetection",
+                                        "abort_finalize_plan",
+                                        "{\"frameIdx\":" + frameIdx
+                                                + ",\"reason\":\"runsse_visible_text_abort\""
+                                                + ",\"emitTurnEnded\":true"
+                                                + ",\"emitConnectTrailer\":true}");
+                                dispatchSyntheticBidiCancel(request, runId, "proxy_abort_token");
+                                emitAbortTerminationFramesTracked(
+                                        clientChannel, true, runId, frameIdx);
+                                call.cancel();
+                                LOG.info("[H2Proxy] Upstream RST sent (call.cancel)");
+                                finishChunkedResponseTracked(
+                                        clientChannel,
+                                        keepAlive,
+                                        runId,
+                                        "H11",
+                                        "runsse_visible_text_abort");
+                                return;
+                            }
+                        } else if (needleIdx >= 0) {
                             byte[] prefix = Arrays.copyOfRange(decompressed, 0, needleIdx);
                             boolean isAssistant =
                                     ConnectProtoUtil.lastRoleBeforeNeedleIsAssistant(prefix);
@@ -763,20 +915,44 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                                             + ",\"compressed\":" + compressed
                                             + ",\"isAssistant\":" + isAssistant
                                             + ",\"textPreview\":\""
-                                            + esc(oneLinePreview(sanitizeAssistantText(text), 160)) + "\"}");
+                                            + esc(oneLinePreview(sanitizedText, 160)) + "\"}");
                             // #endregion
                             if (isAssistant) {
                                 LOG.info("[H2Proxy] *** ABORT TOKEN matched at frame#" + frameIdx + " ***");
                                 byte[] cleaned = ConnectProtoUtil.removeAbortTokenFromWire(
                                         wire, abortTokenBytes);
                                 if (cleaned != null && cleaned.length > 5) {
-                                    clientChannel.writeAndFlush(new DefaultHttpContent(
+                                    final int cleanedFrameIdx = frameIdx;
+                                    final int cleanedLen = cleaned.length;
+                                    ChannelFuture cleanedFuture = clientChannel.writeAndFlush(new DefaultHttpContent(
                                             Unpooled.wrappedBuffer(cleaned)));
+                                    if (cleanedFuture != null) {
+                                        cleanedFuture.addListener(f -> {
+                                            // #region agent log
+                                            dbg(runId, "H12",
+                                                    "CursorHttp2StreamAbortIntercept.streamWithAbortDetection",
+                                                    "abort_cleaned_frame_flushed",
+                                                    "{\"frameIdx\":" + cleanedFrameIdx
+                                                            + ",\"cleanedLen\":" + cleanedLen
+                                                            + ",\"success\":" + f.isSuccess()
+                                                            + ",\"cause\":\""
+                                                            + esc(f.cause() == null ? null : String.valueOf(f.cause()))
+                                                            + "\"}");
+                                            // #endregion
+                                        });
+                                    }
                                     LOG.info("[H2Proxy] Forwarded cleaned frame (" + cleaned.length + " bytes)");
                                 }
+                                emitAbortTerminationFramesTracked(
+                                        clientChannel, false, runId, frameIdx);
                                 call.cancel();
                                 LOG.info("[H2Proxy] Upstream RST sent (call.cancel)");
-                                finishChunkedResponse(clientChannel, keepAlive);
+                                finishChunkedResponseTracked(
+                                        clientChannel,
+                                        keepAlive,
+                                        runId,
+                                        "H11",
+                                        "direct_connect_abort");
                                 return;
                             }
                             // #region agent log
@@ -786,7 +962,7 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                                     "{\"frameIdx\":" + frameIdx
                                             + ",\"needleIdx\":" + needleIdx
                                             + ",\"textPreview\":\""
-                                            + esc(oneLinePreview(sanitizeAssistantText(text), 160)) + "\"}");
+                                            + esc(oneLinePreview(sanitizedText, 160)) + "\"}");
                             // #endregion
                             LOG.info("[H2Proxy] Abort token in rule/thinking, ignoring");
                         }
@@ -821,11 +997,20 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             return RouteKind.PASSTHROUGH;
         }
         String path = normalizePath(request.uri());
+        // #region agent log
+        dbg("route-probe", "H_ROUTE",
+                "CursorHttp2StreamAbortIntercept.classifyRoute",
+                "route_classify_probe",
+                "{\"path\":\"" + esc(path)
+                        + "\",\"forceRunSseBridge\":" + FORCE_RUNSSE_UNIFIED_CHAT_BRIDGE + "}");
+        // #endregion
         if (path.contains("BidiAppend")) {
             return RouteKind.CACHE_BIDI_PASSTHROUGH;
         }
         if (path.contains("RunSSE")) {
-            return RouteKind.BRIDGE_TO_UNIFIED_CHAT;
+            return FORCE_RUNSSE_UNIFIED_CHAT_BRIDGE
+                    ? RouteKind.BRIDGE_TO_UNIFIED_CHAT
+                    : RouteKind.PROXY_HTTP2_DIRECT;
         }
         if (path.contains("StreamUnifiedChat")) {
             return RouteKind.PROXY_HTTP2_DIRECT;
@@ -894,6 +1079,10 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             return false;
         }
         return uri.contains("RunSSE") || uri.contains("StreamUnifiedChat");
+    }
+
+    private static boolean isRunSsePath(String uri) {
+        return uri != null && uri.contains("RunSSE");
     }
 
     // ================================================================
@@ -1073,19 +1262,31 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             }
             if (cachedPrompt != null && !cachedPrompt.trim().isEmpty()) {
                 String model = chooseBridgedModel(sessionModel, resolution);
-                String extraSystemPrompt = findCachedRulesContext(request);
+                BridgedRunContext context = findBridgedContext(request);
                 byte[] built = CursorConnectUpstreamCodec.buildFramedUnifiedChatBody(
-                        model, cachedPrompt, extraSystemPrompt);
+                        model,
+                        cachedPrompt,
+                        toUnifiedChatBridgeContext(context));
                 // #region agent log
                 dbg(runId, "H2",
                         "CursorHttp2StreamAbortIntercept.buildUpstreamBody",
                         "bridge_body_output_bidi_cache",
                         "{\"finalModel\":\"" + esc(model)
                                 + "\",\"promptSource\":\"bidi_cache"
+                                + "\",\"modeName\":\"" + esc(context == null ? null : context.unifiedModeName)
+                                + "\",\"unifiedMode\":" + (context == null ? -1 : context.unifiedMode)
+                                + ",\"disableTools\":" + (context != null && context.disableTools)
+                                + ",\"supportedToolsCount\":"
+                                + (context == null || context.supportedTools == null ? 0 : context.supportedTools.size())
+                                + ",\"mcpToolsCount\":"
+                                + (context == null || context.mcpTools == null ? 0 : context.mcpTools.size())
+                                + ",\"workspaceFoldersCount\":"
+                                + (context == null || context.workspaceFolders == null ? 0 : context.workspaceFolders.size())
                                 + "\",\"promptPreview\":\"" + esc(oneLinePreview(cachedPrompt, 120))
-                                + "\",\"rulesContextLen\":" + (extraSystemPrompt == null ? 0 : extraSystemPrompt.length())
+                                + "\",\"rulesContextLen\":"
+                                + (context == null || context.rulesContext == null ? 0 : context.rulesContext.length())
                                 + ",\"rulesContextPreview\":\""
-                                + esc(oneLinePreview(extraSystemPrompt, 180))
+                                + esc(oneLinePreview(context == null ? null : context.rulesContext, 180))
                                 + "\",\"outLen\":" + built.length + "}");
                 // #endregion
                 LOG.info("[H2Proxy] Body: RunSSE->UnifiedChat from cached Bidi prompt, len="
@@ -1181,18 +1382,18 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         return null;
     }
 
-    private String findCachedRulesContext(DownstreamRequest request) {
+    private BridgedRunContext findBridgedContext(DownstreamRequest request) {
         String requestId = extractRequestIdFromRunSseBody(request.body);
         if (requestId != null) {
-            String cached = REQUEST_RULES_CACHE.get(requestId);
-            if (cached != null && !cached.trim().isEmpty()) {
+            BridgedRunContext cached = REQUEST_BRIDGED_CONTEXT_CACHE.get(requestId);
+            if (cached != null) {
                 return cached;
             }
         }
         String sessionId = headerFirst(request.headers, "x-session-id");
         if (sessionId != null) {
-            String cached = SESSION_RULES_CACHE.get(sessionId);
-            if (cached != null && !cached.trim().isEmpty()) {
+            BridgedRunContext cached = SESSION_BRIDGED_CONTEXT_CACHE.get(sessionId);
+            if (cached != null) {
                 return cached;
             }
         }
@@ -1212,9 +1413,21 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         if (sessionId == null && pipeline.getRequestProto() != null) {
             sessionId = pipeline.getRequestProto().getHost();
         }
+        String hostFallback = pipeline.getRequestProto() == null
+                ? null : pipeline.getRequestProto().getHost();
+        String host = extractHost(request.headers(), hostFallback);
+        String bidiUpstreamUrl = host == null || host.isEmpty()
+                ? null : "https://" + host + normalizedPath;
         byte[] payload = decodeBidiOuterBody(body);
         String outerRequestId = extractRequestIdFromDecodedBidiPayload(payload);
         Long appendSeqNo = extractVarintField(payload, 3);
+        cacheBidiAbortControl(
+                outerRequestId,
+                sessionId,
+                bidiUpstreamUrl,
+                normalizedPath,
+                request.headers(),
+                appendSeqNo);
         String hexData = extractStringField(payload, 1);
         byte[] agentClientMsg = decodeHex(hexData);
         String topMessage = null;
@@ -1282,6 +1495,7 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             structuredText = extractStringField(userMessage, 1);
             structuredRichText = extractStringField(userMessage, 8);
             requestContext = extractMessageField(userMessageAction, 2);
+            int modeCode = extractAgentMode(runRequest, userMessage);
             prependUserMessagesCount = countLengthDelimitedField(userMessageAction, 4);
             selectedContext = extractMessageField(userMessage, 3);
             requestContextRulesCount = countLengthDelimitedField(requestContext, 2);
@@ -1309,6 +1523,17 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             recentlyViewedFilesCount = countLengthDelimitedField(ideState, 2);
             visibleFilesPreview = extractIdeStateFilesPreview(ideState, 1, 5);
             rulesContext = extractRulesContext(requestContext);
+            BridgedRunContext bridgedContext = buildBridgedRunContext(
+                    requestContext,
+                    requestEnv,
+                    modeCode,
+                    rulesContext,
+                    extractStringField(runRequest, 8));
+            boolean shouldRefreshBridgedContext =
+                    runRequest != null
+                            || requestContext != null
+                            || (structuredText != null && !structuredText.trim().isEmpty())
+                            || (structuredRichText != null && !structuredRichText.trim().isEmpty());
             // #region agent log
             dbg(debugRunId(request.headers(), outerRequestId), "H6",
                     "CursorHttp2StreamAbortIntercept.cacheBidiContext",
@@ -1346,6 +1571,39 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
                             + ",\"recentlyViewedFilesCount\":" + recentlyViewedFilesCount
                             + ",\"visibleFilesPreview\":\"" + esc(visibleFilesPreview) + "\"}");
             // #endregion
+            // #region agent log
+            dbg(debugRunId(request.headers(), outerRequestId), "H_BRIDGE",
+                    "CursorHttp2StreamAbortIntercept.cacheBidiContext",
+                    "bridge_context_compose_probe",
+                    "{\"agentMode\":" + modeCode
+                            + ",\"modeName\":\"" + esc(agentModeName(modeCode))
+                            + "\",\"bridgedUnifiedMode\":" + bridgedContext.unifiedMode
+                            + ",\"disableTools\":" + bridgedContext.disableTools
+                            + ",\"supportedToolsCount\":" + bridgedContext.supportedTools.size()
+                            + ",\"mcpToolsCount\":" + bridgedContext.mcpTools.size()
+                            + ",\"workspaceFoldersCount\":" + bridgedContext.workspaceFolders.size()
+                            + ",\"shouldRefreshBridgedContext\":" + shouldRefreshBridgedContext
+                            + ",\"rulesContextLen\":" + (rulesContext == null ? 0 : rulesContext.length()) + "}");
+            // #endregion
+            if (shouldRefreshBridgedContext) {
+                if (sessionId != null && !sessionId.isEmpty()) {
+                    SESSION_BRIDGED_CONTEXT_CACHE.put(sessionId, bridgedContext);
+                }
+                if (outerRequestId != null && !outerRequestId.isEmpty()) {
+                    REQUEST_BRIDGED_CONTEXT_CACHE.put(outerRequestId, bridgedContext);
+                }
+            } else {
+                // #region agent log
+                dbg(debugRunId(request.headers(), outerRequestId), "H_BRIDGE",
+                        "CursorHttp2StreamAbortIntercept.cacheBidiContext",
+                        "bridge_context_skip_weak_update",
+                        "{\"topMessage\":\"" + esc(topMessage)
+                                + "\",\"agentMode\":" + modeCode
+                                + ",\"requestContextPresent\":" + (requestContext != null)
+                                + ",\"structuredTextLen\":" + (structuredText == null ? 0 : structuredText.length())
+                                + ",\"structuredRichTextLen\":" + (structuredRichText == null ? 0 : structuredRichText.length()) + "}");
+                // #endregion
+            }
         }
         if (sessionId != null && !sessionId.isEmpty()
                 && structuredModel != null && !structuredModel.isEmpty()) {
@@ -1380,14 +1638,6 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         if (requestId != null && !requestId.isEmpty()) {
             REQUEST_PROMPT_CACHE.put(requestId, prompt);
         }
-        if (rulesContext != null && !rulesContext.trim().isEmpty()) {
-            if (sessionId != null && !sessionId.isEmpty()) {
-                SESSION_RULES_CACHE.put(sessionId, rulesContext);
-            }
-            if (requestId != null && !requestId.isEmpty()) {
-                REQUEST_RULES_CACHE.put(requestId, rulesContext);
-            }
-        }
         // #region agent log
         dbg(debugRunId(request.headers(), requestId), "H1",
                 "CursorHttp2StreamAbortIntercept.cacheBidiContext",
@@ -1404,6 +1654,180 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         LOG.info("[H2Proxy] Cached Bidi prompt len=" + prompt.length()
                 + (requestId != null ? ", requestId=" + trunc(requestId, 36) : "")
                 + (sessionId != null ? ", session=" + trunc(sessionId, 16) : ""));
+    }
+
+    private void cacheBidiAbortControl(String requestId,
+                                       String sessionId,
+                                       String upstreamUrl,
+                                       String normalizedPath,
+                                       HttpHeaders headers,
+                                       Long appendSeqNo) {
+        if (requestId == null || requestId.isEmpty() || appendSeqNo == null) {
+            return;
+        }
+        final HttpHeaders headerSnapshot = headers == null ? null : copyHeaders(headers);
+        REQUEST_BIDI_ABORT_CACHE.compute(requestId, (ignored, existing) -> {
+            long lastSeq = appendSeqNo;
+            if (existing != null) {
+                lastSeq = Math.max(lastSeq, existing.lastAppendSeqNo);
+            }
+            HttpHeaders effectiveHeaders = headerSnapshot != null
+                    ? copyHeaders(headerSnapshot)
+                    : existing == null ? new io.netty.handler.codec.http.DefaultHttpHeaders()
+                    : copyHeaders(existing.headers);
+            return new BidiAbortControl(
+                    requestId,
+                    firstNonBlank(sessionId, existing == null ? null : existing.sessionId),
+                    firstNonBlank(upstreamUrl, existing == null ? null : existing.upstreamUrl),
+                    firstNonBlank(normalizedPath, existing == null ? null : existing.normalizedPath),
+                    effectiveHeaders,
+                    lastSeq);
+        });
+    }
+
+    private void dispatchSyntheticBidiCancel(DownstreamRequest request, String runId, String reason) {
+        String requestId = extractRequestIdFromRunSseBody(request.body);
+        if (requestId == null || requestId.isEmpty()) {
+            // #region agent log
+            dbg(runId, "H17",
+                    "CursorHttp2StreamAbortIntercept.dispatchSyntheticBidiCancel",
+                    "bidi_cancel_skip_missing_request_id",
+                    "{\"reason\":\"" + esc(reason) + "\"}");
+            // #endregion
+            return;
+        }
+        BidiAbortControl control = REQUEST_BIDI_ABORT_CACHE.get(requestId);
+        if (control == null || control.upstreamUrl == null || control.upstreamUrl.isEmpty()) {
+            // #region agent log
+            dbg(runId, "H17",
+                    "CursorHttp2StreamAbortIntercept.dispatchSyntheticBidiCancel",
+                    "bidi_cancel_skip_missing_context",
+                    "{\"requestId\":\"" + esc(requestId)
+                            + "\",\"reason\":\"" + esc(reason) + "\"}");
+            // #endregion
+            return;
+        }
+        long cancelSeqNo = Math.max(0L, control.lastAppendSeqNo) + 1L;
+        byte[] rawBody = buildSyntheticBidiCancelBody(requestId, cancelSeqNo, reason);
+        if (rawBody == null || rawBody.length == 0) {
+            // #region agent log
+            dbg(runId, "H17",
+                    "CursorHttp2StreamAbortIntercept.dispatchSyntheticBidiCancel",
+                    "bidi_cancel_skip_build_failed",
+                    "{\"requestId\":\"" + esc(requestId)
+                            + "\",\"cancelSeqNo\":" + cancelSeqNo + "}");
+            // #endregion
+            return;
+        }
+        Request cancelRequest;
+        try {
+            cancelRequest = buildSyntheticBidiCancelRequest(control, rawBody);
+        } catch (Exception e) {
+            // #region agent log
+            dbg(runId, "H17",
+                    "CursorHttp2StreamAbortIntercept.dispatchSyntheticBidiCancel",
+                    "bidi_cancel_skip_request_build_failed",
+                    "{\"requestId\":\"" + esc(requestId)
+                            + "\",\"cancelSeqNo\":" + cancelSeqNo
+                            + ",\"error\":\""
+                            + esc(e.getClass().getSimpleName() + ": " + e.getMessage()) + "\"}");
+            // #endregion
+            return;
+        }
+        REQUEST_BIDI_ABORT_CACHE.put(
+                requestId,
+                new BidiAbortControl(
+                        control.requestId,
+                        control.sessionId,
+                        control.upstreamUrl,
+                        control.normalizedPath,
+                        copyHeaders(control.headers),
+                        cancelSeqNo));
+        // #region agent log
+        dbg(runId, "H17",
+                "CursorHttp2StreamAbortIntercept.dispatchSyntheticBidiCancel",
+                "bidi_cancel_dispatched",
+                "{\"requestId\":\"" + esc(requestId)
+                        + "\",\"cancelSeqNo\":" + cancelSeqNo
+                        + ",\"upstreamUrl\":\"" + esc(control.upstreamUrl)
+                        + "\",\"reason\":\"" + esc(reason) + "\"}");
+        // #endregion
+        okHttpClient.newCall(cancelRequest).enqueue(new Callback() {
+            @Override
+            public void onResponse(Call call, Response response) {
+                // #region agent log
+                dbg(runId, "H17",
+                        "CursorHttp2StreamAbortIntercept.dispatchSyntheticBidiCancel.onResponse",
+                        "bidi_cancel_response",
+                        "{\"requestId\":\"" + esc(requestId)
+                                + "\",\"status\":" + response.code()
+                                + ",\"protocol\":\"" + esc(String.valueOf(response.protocol()))
+                                + "\"}");
+                // #endregion
+                response.close();
+            }
+
+            @Override
+            public void onFailure(Call call, IOException e) {
+                // #region agent log
+                dbg(runId, "H17",
+                        "CursorHttp2StreamAbortIntercept.dispatchSyntheticBidiCancel.onFailure",
+                        "bidi_cancel_failure",
+                        "{\"requestId\":\"" + esc(requestId)
+                                + "\",\"canceled\":" + call.isCanceled()
+                                + ",\"error\":\""
+                                + esc(e.getClass().getSimpleName() + ": " + e.getMessage()) + "\"}");
+                // #endregion
+            }
+        });
+    }
+
+    private Request buildSyntheticBidiCancelRequest(BidiAbortControl control, byte[] rawBody) {
+        HttpHeaders forwarded = copyHeaders(control.headers);
+        stripHopByHopRequestHeaders(forwarded);
+        byte[] bodyBytes = rawBody;
+        String contentEncoding = headerFirst(forwarded, HttpHeaderNames.CONTENT_ENCODING.toString());
+        if (contentEncoding != null && contentEncoding.toLowerCase(Locale.ROOT).contains("gzip")) {
+            byte[] gzipped = ConnectProtoUtil.gzipCompress(rawBody);
+            if (gzipped != null && gzipped.length > 0) {
+                bodyBytes = gzipped;
+            } else {
+                forwarded.remove(HttpHeaderNames.CONTENT_ENCODING);
+            }
+        } else {
+            forwarded.remove(HttpHeaderNames.CONTENT_ENCODING);
+        }
+        if (headerModifier != null) {
+            headerModifier.accept(forwarded);
+        }
+        MediaType mediaType = parseMediaType(forwarded.get(HttpHeaderNames.CONTENT_TYPE));
+        RequestBody requestBody = RequestBody.create(mediaType, bodyBytes);
+        Request.Builder builder = new Request.Builder()
+                .url(control.upstreamUrl)
+                .method(HttpMethod.POST.name(), requestBody);
+        for (Map.Entry<String, String> e : forwarded) {
+            builder.addHeader(e.getKey(), e.getValue());
+        }
+        return builder.build();
+    }
+
+    private static byte[] buildSyntheticBidiCancelBody(String requestId, long appendSeqNo, String reason) {
+        if (requestId == null || requestId.isEmpty()) {
+            return null;
+        }
+        try {
+            byte[] cancelAction = encodeLengthDelimitedField(1, utf8(firstNonBlank(reason, "proxy_abort_token")));
+            byte[] conversationAction = encodeLengthDelimitedField(3, cancelAction);
+            byte[] agentClientMessage = encodeLengthDelimitedField(4, conversationAction);
+            byte[] requestIdMsg = encodeLengthDelimitedField(1, utf8(requestId));
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            out.write(encodeLengthDelimitedField(1, utf8(encodeHex(agentClientMessage))));
+            out.write(encodeLengthDelimitedField(2, requestIdMsg));
+            out.write(encodeVarintField(3, appendSeqNo));
+            return out.toByteArray();
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     private static String extractRequestIdFromRunSseBody(byte[] body) {
@@ -1505,6 +1929,190 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             sb.append("Cloud rule:\n").append(cloudRule.trim());
         }
         return sb.length() == 0 ? null : sb.toString();
+    }
+
+    private static int extractAgentMode(byte[] runRequest, byte[] userMessage) {
+        Long mode = extractVarintField(userMessage, 4);
+        if (mode == null) {
+            byte[] conversationState = extractMessageField(runRequest, 1);
+            mode = extractVarintField(conversationState, 10);
+        }
+        return mode == null ? 2 : mode.intValue();
+    }
+
+    private BridgedRunContext buildBridgedRunContext(byte[] requestContext,
+                                                     byte[] requestEnv,
+                                                     int agentMode,
+                                                     String rulesContext,
+                                                     String customSystemPrompt) {
+        List<Integer> supportedTools = defaultSupportedTools();
+        List<CursorConnectUpstreamCodec.UnifiedChatTool> mcpTools = extractBridgedMcpTools(requestContext);
+        List<CursorConnectUpstreamCodec.WorkspaceFolderContext> workspaceFolders =
+                extractWorkspaceFolders(requestEnv);
+        CursorConnectUpstreamCodec.EnvironmentContext environment =
+                extractEnvironmentContext(requestEnv, workspaceFolders);
+        String modeName = agentModeName(agentMode);
+        int unifiedMode = CursorConnectUpstreamCodec.UnifiedChatBridgeContext.modeFromName(modeName);
+        boolean usesRules = rulesContext != null && !rulesContext.trim().isEmpty();
+        String planningInstructions = unifiedMode == 5 ? firstNonBlank(customSystemPrompt, rulesContext) : null;
+        return new BridgedRunContext(
+                rulesContext,
+                unifiedMode,
+                modeName,
+                supportedTools.isEmpty() && mcpTools.isEmpty(),
+                usesRules,
+                true,
+                !mcpTools.isEmpty(),
+                requestEnv == null ? null : extractStringField(requestEnv, 7),
+                requestEnv == null ? null : extractStringField(requestEnv, 12),
+                planningInstructions,
+                supportedTools,
+                mcpTools,
+                workspaceFolders,
+                environment);
+    }
+
+    private static CursorConnectUpstreamCodec.UnifiedChatBridgeContext toUnifiedChatBridgeContext(
+            BridgedRunContext context) {
+        if (context == null) {
+            return CursorConnectUpstreamCodec.UnifiedChatBridgeContext.ask(null);
+        }
+        return new CursorConnectUpstreamCodec.UnifiedChatBridgeContext(
+                context.rulesContext,
+                context.unifiedMode,
+                context.unifiedModeName,
+                context.disableTools,
+                context.usesRules,
+                context.supportsMermaidDiagrams,
+                context.hasMcpDescriptors,
+                context.terminalsFolder,
+                context.agentTranscriptsFolder,
+                context.customPlanningInstructions,
+                context.supportedTools,
+                context.mcpTools,
+                context.workspaceFolders,
+                context.environment);
+    }
+
+    private static String agentModeName(int agentMode) {
+        switch (agentMode) {
+            case 1:
+                return "Agent";
+            case 3:
+                return "Plan";
+            case 4:
+                return "Debug";
+            case 5:
+                return "Agent";
+            case 6:
+                return "Agent";
+            case 2:
+            default:
+                return "Ask";
+        }
+    }
+
+    private static List<Integer> defaultSupportedTools() {
+        List<Integer> tools = new ArrayList<Integer>();
+        tools.add(40);
+        tools.add(39);
+        tools.add(41);
+        tools.add(42);
+        tools.add(15);
+        tools.add(44);
+        tools.add(45);
+        tools.add(49);
+        tools.add(51);
+        tools.add(52);
+        tools.add(57);
+        return tools;
+    }
+
+    private List<CursorConnectUpstreamCodec.UnifiedChatTool> extractBridgedMcpTools(byte[] requestContext) {
+        List<CursorConnectUpstreamCodec.UnifiedChatTool> tools =
+                new ArrayList<CursorConnectUpstreamCodec.UnifiedChatTool>();
+        if (requestContext == null || requestContext.length == 0) {
+            return tools;
+        }
+        for (byte[] toolMsg : extractRepeatedMessageFields(requestContext, 7)) {
+            String name = firstNonBlank(
+                    extractStringField(toolMsg, 1),
+                    extractStringField(toolMsg, 5),
+                    extractStringField(toolMsg, 2));
+            if (name == null || name.isEmpty()) {
+                continue;
+            }
+            String description = extractStringField(toolMsg, 2);
+            String serverName = extractStringField(toolMsg, 4);
+            String inputSchema = extractNestedFirstStringField(toolMsg, 3);
+            tools.add(new CursorConnectUpstreamCodec.UnifiedChatTool(
+                    name,
+                    description,
+                    firstNonBlank(inputSchema, "{}"),
+                    serverName));
+        }
+        return tools;
+    }
+
+    private List<CursorConnectUpstreamCodec.WorkspaceFolderContext> extractWorkspaceFolders(byte[] requestEnv) {
+        List<CursorConnectUpstreamCodec.WorkspaceFolderContext> folders =
+                new ArrayList<CursorConnectUpstreamCodec.WorkspaceFolderContext>();
+        if (requestEnv == null || requestEnv.length == 0) {
+            return folders;
+        }
+        for (String workspacePath : extractRepeatedStringFields(requestEnv, 2)) {
+            if (workspacePath == null || workspacePath.trim().isEmpty()) {
+                continue;
+            }
+            String trimmed = workspacePath.trim();
+            folders.add(new CursorConnectUpstreamCodec.WorkspaceFolderContext(
+                    toFileUri(trimmed),
+                    baseName(trimmed)));
+        }
+        return folders;
+    }
+
+    private CursorConnectUpstreamCodec.EnvironmentContext extractEnvironmentContext(
+            byte[] requestEnv,
+            List<CursorConnectUpstreamCodec.WorkspaceFolderContext> workspaceFolders) {
+        String osVersion = requestEnv == null ? null : extractStringField(requestEnv, 1);
+        String shell = requestEnv == null ? null : extractStringField(requestEnv, 3);
+        String timezone = requestEnv == null ? null : extractStringField(requestEnv, 10);
+        String homeDirectory = requestEnv == null ? null : extractStringField(requestEnv, 11);
+        List<String> workspaceUris = new ArrayList<String>();
+        for (CursorConnectUpstreamCodec.WorkspaceFolderContext folder : workspaceFolders) {
+            if (folder != null && folder.uri != null && !folder.uri.isEmpty()) {
+                workspaceUris.add(folder.uri);
+            }
+        }
+        return new CursorConnectUpstreamCodec.EnvironmentContext(
+                "win32",
+                osVersion,
+                shell,
+                "Windows",
+                timezone,
+                homeDirectory,
+                workspaceUris,
+                CursorConnectUpstreamCodec.CLIENT_VERSION);
+    }
+
+    private static String toFileUri(String path) {
+        String normalized = path.replace('\\', '/');
+        if (normalized.matches("^[A-Za-z]:/.*")) {
+            return "file:///" + normalized;
+        }
+        return normalized.startsWith("file://") ? normalized : "file://" + normalized;
+    }
+
+    private static String baseName(String path) {
+        if (path == null || path.isEmpty()) {
+            return "";
+        }
+        String normalized = path.replace('\\', '/');
+        int slash = normalized.lastIndexOf('/');
+        return slash >= 0 && slash + 1 < normalized.length()
+                ? normalized.substring(slash + 1)
+                : normalized;
     }
 
     private static String extractRulePathsPreview(byte[] requestContext, int limit) {
@@ -2031,6 +2639,18 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         return out;
     }
 
+    private static String encodeHex(byte[] data) {
+        if (data == null || data.length == 0) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(data.length * 2);
+        for (byte b : data) {
+            sb.append(Character.forDigit((b >>> 4) & 0x0F, 16));
+            sb.append(Character.forDigit(b & 0x0F, 16));
+        }
+        return sb.toString();
+    }
+
     private static void collectRichTextCandidates(byte[] data, int depth, int maxDepth, Candidate best) {
         if (data == null || data.length == 0 || depth > maxDepth) {
             return;
@@ -2274,6 +2894,69 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         return buildWireFrame(2, utf8("{}"));
     }
 
+    private static void emitAbortTerminationFrames(Channel clientChannel, boolean emitRunSseTurnEnded) {
+        if (emitRunSseTurnEnded) {
+            writeConnectFrame(clientChannel, buildAgentTurnEndedFrame());
+        }
+        writeConnectFrame(clientChannel, buildConnectSuccessEndStreamFrame());
+    }
+
+    private static void emitAbortTerminationFramesTracked(Channel clientChannel,
+                                                          boolean emitRunSseTurnEnded,
+                                                          String runId,
+                                                          int frameIdx) {
+        if (emitRunSseTurnEnded) {
+            ChannelFuture turnEndedFuture = writeConnectFrameFuture(
+                    clientChannel, buildAgentTurnEndedFrame());
+            if (turnEndedFuture == null) {
+                // #region agent log
+                dbg(runId, "H12",
+                        "CursorHttp2StreamAbortIntercept.emitAbortTerminationFramesTracked",
+                        "abort_turn_ended_skipped",
+                        "{\"frameIdx\":" + frameIdx
+                                + ",\"channelActive\":" + clientChannel.isActive() + "}");
+                // #endregion
+            } else {
+                turnEndedFuture.addListener(f -> {
+                    // #region agent log
+                    dbg(runId, "H12",
+                            "CursorHttp2StreamAbortIntercept.emitAbortTerminationFramesTracked",
+                            "abort_turn_ended_flushed",
+                            "{\"frameIdx\":" + frameIdx
+                                    + ",\"success\":" + f.isSuccess()
+                                    + ",\"cause\":\""
+                                    + esc(f.cause() == null ? null : String.valueOf(f.cause()))
+                                    + "\"}");
+                    // #endregion
+                });
+            }
+        }
+        ChannelFuture trailerFuture = writeConnectFrameFuture(
+                clientChannel, buildConnectSuccessEndStreamFrame());
+        if (trailerFuture == null) {
+            // #region agent log
+            dbg(runId, "H12",
+                    "CursorHttp2StreamAbortIntercept.emitAbortTerminationFramesTracked",
+                    "abort_connect_trailer_skipped",
+                    "{\"frameIdx\":" + frameIdx
+                            + ",\"channelActive\":" + clientChannel.isActive() + "}");
+            // #endregion
+            return;
+        }
+        trailerFuture.addListener(f -> {
+            // #region agent log
+            dbg(runId, "H12",
+                    "CursorHttp2StreamAbortIntercept.emitAbortTerminationFramesTracked",
+                    "abort_connect_trailer_flushed",
+                    "{\"frameIdx\":" + frameIdx
+                            + ",\"success\":" + f.isSuccess()
+                            + ",\"cause\":\""
+                            + esc(f.cause() == null ? null : String.valueOf(f.cause()))
+                            + "\"}");
+            // #endregion
+        });
+    }
+
     private static byte[] utf8(String s) {
         return s == null ? new byte[0] : s.getBytes(StandardCharsets.UTF_8);
     }
@@ -2286,10 +2969,30 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
         return out.toByteArray();
     }
 
+    private static byte[] encodeVarintField(int fieldNumber, long value) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream(16);
+        writeVarint(out, (fieldNumber << 3));
+        writeVarint64(out, value);
+        return out.toByteArray();
+    }
+
     private static void writeVarint(ByteArrayOutputStream out, int value) {
         int v = value;
         while (true) {
             int b = v & 0x7F;
+            v >>>= 7;
+            if (v == 0) {
+                out.write(b);
+                return;
+            }
+            out.write(b | 0x80);
+        }
+    }
+
+    private static void writeVarint64(ByteArrayOutputStream out, long value) {
+        long v = value;
+        while (true) {
+            int b = (int) (v & 0x7FL);
             v >>>= 7;
             if (v == 0) {
                 out.write(b);
@@ -2546,7 +3249,7 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
 
     private static void dl(String loc, String msg, String data) {
         try (FileWriter fw = new FileWriter(DEBUG_LOG_PATH, true)) {
-            fw.write("{\"sessionId\":\"064e27\",\"location\":\"" + esc(loc)
+            fw.write("{\"sessionId\":\"" + DEBUG_SESSION_ID + "\",\"location\":\"" + esc(loc)
                     + "\",\"message\":\"" + esc(msg)
                     + "\",\"data\":" + (data != null ? data : "null")
                     + ",\"timestamp\":" + System.currentTimeMillis() + "}\n");
@@ -2555,8 +3258,18 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
     }
 
     private static void dbg(String runId, String hypothesisId, String loc, String msg, String data) {
-        try (FileWriter fw = new FileWriter(DEBUG_RUNTIME_LOG_PATH, true)) {
-            fw.write("{\"sessionId\":\"" + DEBUG_RUNTIME_SESSION_ID
+        appendDebugLog(DEBUG_SESSION_LOG_PATH, DEBUG_SESSION_ID, runId, hypothesisId, loc, msg, data);
+        if (!DEBUG_RUNTIME_LOG_PATH.equals(DEBUG_SESSION_LOG_PATH)
+                || !DEBUG_RUNTIME_SESSION_ID.equals(DEBUG_SESSION_ID)) {
+            appendDebugLog(DEBUG_RUNTIME_LOG_PATH, DEBUG_RUNTIME_SESSION_ID, runId, hypothesisId, loc, msg, data);
+        }
+    }
+
+    private static void appendDebugLog(String path, String sessionId,
+                                       String runId, String hypothesisId,
+                                       String loc, String msg, String data) {
+        try (FileWriter fw = new FileWriter(path, true)) {
+            fw.write("{\"sessionId\":\"" + sessionId
                     + "\",\"runId\":\"" + esc(runId)
                     + "\",\"hypothesisId\":\"" + esc(hypothesisId)
                     + "\",\"location\":\"" + esc(loc)
@@ -2667,6 +3380,76 @@ public class CursorHttp2StreamAbortIntercept extends HttpProxyIntercept {
             this.keepAlive = keepAlive;
             this.abortAware = abortAware;
             this.routeKind = routeKind;
+        }
+    }
+
+    private static final class BridgedRunContext {
+        final String rulesContext;
+        final int unifiedMode;
+        final String unifiedModeName;
+        final boolean disableTools;
+        final boolean usesRules;
+        final boolean supportsMermaidDiagrams;
+        final boolean hasMcpDescriptors;
+        final String terminalsFolder;
+        final String agentTranscriptsFolder;
+        final String customPlanningInstructions;
+        final List<Integer> supportedTools;
+        final List<CursorConnectUpstreamCodec.UnifiedChatTool> mcpTools;
+        final List<CursorConnectUpstreamCodec.WorkspaceFolderContext> workspaceFolders;
+        final CursorConnectUpstreamCodec.EnvironmentContext environment;
+
+        private BridgedRunContext(String rulesContext,
+                                  int unifiedMode,
+                                  String unifiedModeName,
+                                  boolean disableTools,
+                                  boolean usesRules,
+                                  boolean supportsMermaidDiagrams,
+                                  boolean hasMcpDescriptors,
+                                  String terminalsFolder,
+                                  String agentTranscriptsFolder,
+                                  String customPlanningInstructions,
+                                  List<Integer> supportedTools,
+                                  List<CursorConnectUpstreamCodec.UnifiedChatTool> mcpTools,
+                                  List<CursorConnectUpstreamCodec.WorkspaceFolderContext> workspaceFolders,
+                                  CursorConnectUpstreamCodec.EnvironmentContext environment) {
+            this.rulesContext = rulesContext;
+            this.unifiedMode = unifiedMode;
+            this.unifiedModeName = unifiedModeName;
+            this.disableTools = disableTools;
+            this.usesRules = usesRules;
+            this.supportsMermaidDiagrams = supportsMermaidDiagrams;
+            this.hasMcpDescriptors = hasMcpDescriptors;
+            this.terminalsFolder = terminalsFolder;
+            this.agentTranscriptsFolder = agentTranscriptsFolder;
+            this.customPlanningInstructions = customPlanningInstructions;
+            this.supportedTools = supportedTools;
+            this.mcpTools = mcpTools;
+            this.workspaceFolders = workspaceFolders;
+            this.environment = environment;
+        }
+    }
+
+    private static final class BidiAbortControl {
+        final String requestId;
+        final String sessionId;
+        final String upstreamUrl;
+        final String normalizedPath;
+        final HttpHeaders headers;
+        final long lastAppendSeqNo;
+
+        private BidiAbortControl(String requestId,
+                                 String sessionId,
+                                 String upstreamUrl,
+                                 String normalizedPath,
+                                 HttpHeaders headers,
+                                 long lastAppendSeqNo) {
+            this.requestId = requestId;
+            this.sessionId = sessionId;
+            this.upstreamUrl = upstreamUrl;
+            this.normalizedPath = normalizedPath;
+            this.headers = headers;
+            this.lastAppendSeqNo = lastAppendSeqNo;
         }
     }
 

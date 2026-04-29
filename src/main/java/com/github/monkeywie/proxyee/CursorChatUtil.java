@@ -80,7 +80,7 @@ public class CursorChatUtil {
 
     /** StreamUnifiedChatRequest.UnifiedMode: Chat */
     private static final int UNIFIED_MODE_CHAT = 1;
-
+    private static final int UNIFIED_MODE_AGENT = 2;
     // ======================== 设备指纹（防止每次变化被锁号） ========================
 
     /**
@@ -359,7 +359,8 @@ public class CursorChatUtil {
                 .header("x-cursor-checksum", checksum)
                 .header("x-cursor-client-version", CLIENT_VERSION)
                 .header("x-cursor-streaming", "true")
-                .header("x-cursor-timezone", "Asia/Shanghai")
+//                .header("x-cursor-timezone", "Asia/Shanghai")
+                .header("x-cursor-timezone", "America/New_York")
                 .header("x-ghost-mode", "true")
                 .header("x-new-onboarding-completed", "false")
                 .header("x-request-id", requestId)
@@ -459,22 +460,22 @@ public class CursorChatUtil {
         writeBytes(requestBuf, 26, envInfo);
 
         // field 27: is_agentic = false (protobuf默认值，不写入)
-
+        writeBool(requestBuf, 27, true);
         // field 37: allow_model_fallbacks = false
         writeBool(requestBuf, 37, false);
 
-        // field 46: unified_mode = UNIFIED_MODE_CHAT (1)
-        writeEnum(requestBuf, 46, UNIFIED_MODE_CHAT);
+        // field 46: unified_mode = UNIFIED_MODE_AGENT (1)
+        writeEnum(requestBuf, 46, UNIFIED_MODE_AGENT);
 
         // field 48: should_disable_tools = true
-        writeBool(requestBuf, 48, true);
+        writeBool(requestBuf, 48, false);
 
         // field 49: thinking_level = THINKING_LEVEL_UNSPECIFIED (0) (protobuf默认值，不写入)
 
         // field 51: uses_rules = false (protobuf默认值，不写入)
 
-        // field 54: unified_mode_name = "Ask"
-        writeString(requestBuf, 54, "Ask");
+        // field 54: unified_mode_name = "Aagent"
+        writeString(requestBuf, 54, "Agent");
 
         byte[] streamUnifiedChatRequest = requestBuf.toByteArray();
 
@@ -516,7 +517,7 @@ public class CursorChatUtil {
         }
 
         // field 47: unified_mode = Chat
-        writeEnum(buf, 47, UNIFIED_MODE_CHAT);
+        writeEnum(buf, 47, UNIFIED_MODE_AGENT);
 
         return buf.toByteArray();
     }
@@ -1034,7 +1035,7 @@ public class CursorChatUtil {
 //        String multiReply = chat(token, "claude-3.5-sonnet", messages);
 //        System.out.println("回复: " + multiReply);
 
-        Call call = CursorChatUtil.createChatStreamCall(token, "default", Message.ofUser("帮我计算下50*9*6。事干完后，结束语记得用：zmgnb666，牛逼！然后接200字夸我的话"));
+        Call call = CursorChatUtil.createChatStreamCall(token, "default", Message.ofUser("帮我计算下50*9*6。事干完后，结束语记得说：zmgnb666，牛逼！然后接200字夸我的话"));
         AtomicInteger totalLength = new AtomicInteger(0);
 // 异步执行
         AtomicBoolean flag = new AtomicBoolean(false);

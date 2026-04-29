@@ -29,6 +29,7 @@ import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.AttributeKey;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -81,6 +82,9 @@ public class CursorChatOnlyIntercept extends HttpProxyIntercept {
         t.setDaemon(true);
         return t;
     });
+
+    private static final AttributeKey<ByteArrayOutputStream> ATTR_UPSTREAM_CONNECT_BUF =
+            AttributeKey.valueOf("cursor.chat.upstreamConnectBuf");
 
     public CursorChatOnlyIntercept(CursorChatMode mode,
                                   Consumer<io.netty.handler.codec.http.HttpHeaders> headerModifier) {
@@ -142,6 +146,36 @@ public class CursorChatOnlyIntercept extends HttpProxyIntercept {
             clientChannel.pipeline().remove("cursorChatOnlyDecompress");
         }
         pipeline.afterResponse(clientChannel, proxyChannel, httpResponse);
+    }
+
+    @Override
+    public void afterResponse(Channel clientChannel, Channel proxyChannel, io.netty.handler.codec.http.HttpContent httpContent,
+                              HttpProxyInterceptPipeline pipeline) throws Exception {
+        try {
+            // 仅在 CURSOR_FORWARD 时抓 Cursor 真正下行帧（用于反推 tool_call/tool_result 格式）
+            if (mode == CursorChatMode.CURSOR_FORWARD && pipeline != null && pipeline.getHttpRequest() != null) {
+                String path = normalizePath(pipeline.getHttpRequest().uri());
+                if (path.contains("RunSSE")) {
+                    ByteArrayOutputStream buf = proxyChannel.attr(ATTR_UPSTREAM_CONNECT_BUF).get();
+                    if (buf == null) {
+                        buf = new ByteArrayOutputStream(16 * 1024);
+                        proxyChannel.attr(ATTR_UPSTREAM_CONNECT_BUF).set(buf);
+                    }
+                    byte[] chunk = extractBytes(httpContent);
+                    if (chunk != null && chunk.length > 0) {
+                        buf.write(chunk);
+                        parseAndLogConnectFrames(buf, "pre");
+                    }
+                    if (httpContent instanceof LastHttpContent) {
+                        // flush remaining (may be incomplete)
+                        parseAndLogConnectFrames(buf, "pre");
+                        proxyChannel.attr(ATTR_UPSTREAM_CONNECT_BUF).set(null);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        pipeline.afterResponse(clientChannel, proxyChannel, httpContent);
     }
 
     private boolean match(HttpRequest httpRequest, HttpProxyInterceptPipeline pipeline) {
@@ -295,6 +329,44 @@ public class CursorChatOnlyIntercept extends HttpProxyIntercept {
                     AgentRunSseModelResolver.ModelResolution mr =
                             AgentRunSseModelResolver.resolveDetail(requestHeaders, normalizePath(requestUri), rawRunSseBody);
                     String model = sanitizeModel(mr == null ? null : mr.model);
+
+                    // #region agent log
+                    // RunSSE 请求体里通常带 rules/skills/tools 元信息；这里仅做统计，不记录具体内容
+                    try {
+                        byte[] payload = rawRunSseBody;
+                        if (payload != null && payload.length >= 5) {
+                            int len = ((payload[1] & 0xFF) << 24)
+                                    | ((payload[2] & 0xFF) << 16)
+                                    | ((payload[3] & 0xFF) << 8)
+                                    | (payload[4] & 0xFF);
+                            if (len > 0 && len <= 4 * 1024 * 1024 && 5 + len <= payload.length) {
+                                byte[] inner = new byte[len];
+                                System.arraycopy(payload, 5, inner, 0, len);
+                                boolean compressed = (payload[0] & 1) != 0;
+                                byte[] d = compressed ? com.github.monkeywie.proxyee.connect.ConnectProtoUtil.gzipDecompress(inner) : inner;
+                                if (d != null) {
+                                    payload = d;
+                                }
+                            }
+                        }
+                        String view = payload == null ? "" : new String(payload, StandardCharsets.UTF_8);
+                        String lower = view.toLowerCase(Locale.ROOT);
+                        int toolHits = countSubstr(lower, "tool");
+                        int skillsHits = countSubstr(lower, "skill");
+                        int rulesHits = countSubstr(lower, "rule");
+                        int functionHits = countSubstr(lower, "function");
+                        dbg("pre", "H_RUNSSE_BODY", "streamLocalOpenAiCompatAsRunSse", "runsse_body_stats",
+                                "{\"bodyLen\":" + (rawRunSseBody == null ? 0 : rawRunSseBody.length)
+                                        + ",\"payloadUtf8Len\":" + lower.length()
+                                        + ",\"toolHits\":" + toolHits
+                                        + ",\"skillsHits\":" + skillsHits
+                                        + ",\"rulesHits\":" + rulesHits
+                                        + ",\"functionHits\":" + functionHits
+                                        + "}");
+                    } catch (Exception ignored) {
+                    }
+                    // #endregion
+
                     String guessed = RunSseToUnifiedChatBodyConverter.extractPromptGuess(rawRunSseBody);
                     String requestId = extractDollarUuidRequestId(guessed);
                     String key = requestId == null ? null : normalizeRequestIdKey(requestId);
@@ -362,6 +434,248 @@ public class CursorChatOnlyIntercept extends HttpProxyIntercept {
         });
     }
 
+    private static int countSubstr(String s, String needle) {
+        if (s == null || needle == null || needle.isEmpty()) {
+            return 0;
+        }
+        int count = 0;
+        int idx = 0;
+        while (true) {
+            int p = s.indexOf(needle, idx);
+            if (p < 0) {
+                return count;
+            }
+            count++;
+            idx = p + needle.length();
+            if (idx >= s.length()) {
+                return count;
+            }
+        }
+    }
+
+    private static String hexPrefix(byte[] bytes, int maxBytes) {
+        if (bytes == null) {
+            return "";
+        }
+        int n = Math.min(bytes.length, Math.max(0, maxBytes));
+        StringBuilder sb = new StringBuilder(n * 2);
+        for (int i = 0; i < n; i++) {
+            int b = bytes[i] & 0xFF;
+            sb.append(Character.forDigit((b >>> 4) & 0xF, 16));
+            sb.append(Character.forDigit(b & 0xF, 16));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 粗略枚举 protobuf 顶层 tag（不解析嵌套），用于反推未知 schema。
+     * 输出形如 "1:2,8:2,49:2"（field:wireType）。
+     */
+    private static String summarizeTopLevelProtobufTags(byte[] data, int maxFields) {
+        if (data == null || data.length == 0 || maxFields <= 0) {
+            return "";
+        }
+        int pos = 0;
+        int fields = 0;
+        StringBuilder sb = new StringBuilder();
+        while (pos < data.length && fields < maxFields) {
+            int[] tag = readVarintBounded(data, pos, data.length);
+            if (tag == null) {
+                break;
+            }
+            int t = tag[0];
+            int fieldNumber = t >>> 3;
+            int wireType = t & 0x07;
+            pos = tag[1];
+            if (fieldNumber == 0) {
+                break;
+            }
+            if (sb.length() > 0) {
+                sb.append(",");
+            }
+            sb.append(fieldNumber).append(":").append(wireType);
+            fields++;
+            switch (wireType) {
+                case 0: { // varint
+                    int[] vv = readVarintBounded(data, pos, data.length);
+                    if (vv == null) {
+                        return sb.toString();
+                    }
+                    pos = vv[1];
+                    break;
+                }
+                case 1: // fixed64
+                    pos += 8;
+                    break;
+                case 2: { // length-delimited
+                    int[] len = readVarintBounded(data, pos, data.length);
+                    if (len == null) {
+                        return sb.toString();
+                    }
+                    int l = len[0];
+                    pos = len[1] + Math.max(0, l);
+                    break;
+                }
+                case 5: // fixed32
+                    pos += 4;
+                    break;
+                default:
+                    return sb.toString();
+            }
+            if (pos < 0 || pos > data.length) {
+                break;
+            }
+        }
+        return sb.toString();
+    }
+
+    private static int[] readVarintBounded(byte[] data, int pos, int limit) {
+        int result = 0;
+        int shift = 0;
+        int p = pos;
+        while (p < limit && shift < 35) {
+            int b = data[p++] & 0xFF;
+            result |= (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) {
+                return new int[]{result, p};
+            }
+            shift += 7;
+        }
+        return null;
+    }
+
+    private static byte[] extractLengthDelimitedField(byte[] data, int targetFieldNumber, int maxLen) {
+        if (data == null || data.length == 0) {
+            return null;
+        }
+        if (maxLen <= 0) {
+            maxLen = Integer.MAX_VALUE;
+        }
+        int pos = 0;
+        while (pos < data.length) {
+            int[] tag = readVarintBounded(data, pos, data.length);
+            if (tag == null) {
+                return null;
+            }
+            int t = tag[0];
+            int fieldNumber = t >>> 3;
+            int wireType = t & 0x07;
+            pos = tag[1];
+            if (fieldNumber == 0) {
+                return null;
+            }
+            if (wireType == 2) {
+                int[] len = readVarintBounded(data, pos, data.length);
+                if (len == null) {
+                    return null;
+                }
+                int l = len[0];
+                pos = len[1];
+                if (l < 0 || pos + l > data.length) {
+                    return null;
+                }
+                if (fieldNumber == targetFieldNumber) {
+                    int take = Math.min(l, maxLen);
+                    byte[] out = new byte[take];
+                    System.arraycopy(data, pos, out, 0, take);
+                    return out;
+                }
+                pos += l;
+            } else if (wireType == 0) {
+                int[] vv = readVarintBounded(data, pos, data.length);
+                if (vv == null) {
+                    return null;
+                }
+                pos = vv[1];
+            } else if (wireType == 1) {
+                pos += 8;
+            } else if (wireType == 5) {
+                pos += 4;
+            } else {
+                return null;
+            }
+            if (pos < 0 || pos > data.length) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private static String listTopLevelLengthDelimitedFieldsMeta(byte[] data, int maxFields, int maxLenEach) {
+        if (data == null || data.length == 0) {
+            return "";
+        }
+        if (maxFields <= 0) {
+            return "";
+        }
+        int pos = 0;
+        int found = 0;
+        StringBuilder sb = new StringBuilder();
+        while (pos < data.length && found < maxFields) {
+            int[] tag = readVarintBounded(data, pos, data.length);
+            if (tag == null) {
+                break;
+            }
+            int t = tag[0];
+            int fieldNumber = t >>> 3;
+            int wireType = t & 0x07;
+            pos = tag[1];
+            if (fieldNumber == 0) {
+                break;
+            }
+            if (wireType == 2) {
+                int[] len = readVarintBounded(data, pos, data.length);
+                if (len == null) {
+                    break;
+                }
+                int l = len[0];
+                pos = len[1];
+                if (l < 0 || pos + l > data.length) {
+                    break;
+                }
+                int take = Math.min(l, maxLenEach <= 0 ? l : maxLenEach);
+                byte[] chunk = new byte[take];
+                System.arraycopy(data, pos, chunk, 0, take);
+
+                String chunkTagSummary = summarizeTopLevelProtobufTags(chunk, 8);
+                String chunkHexPrefix = hexPrefix(chunk, 48);
+                String chunkB64 = java.util.Base64.getEncoder().encodeToString(chunk);
+                if (chunkB64.length() > 256) {
+                    chunkB64 = chunkB64.substring(0, 256) + "...";
+                }
+
+                if (sb.length() > 0) {
+                    sb.append("|");
+                }
+                sb.append("f").append(fieldNumber)
+                        .append(":len=").append(l)
+                        .append(":take=").append(take)
+                        .append(":tags=").append(chunkTagSummary)
+                        .append(":hex=").append(chunkHexPrefix)
+                        .append(":b64=").append(chunkB64);
+
+                found++;
+                pos += l;
+            } else if (wireType == 0) {
+                int[] vv = readVarintBounded(data, pos, data.length);
+                if (vv == null) {
+                    break;
+                }
+                pos = vv[1];
+            } else if (wireType == 1) {
+                pos += 8;
+            } else if (wireType == 5) {
+                pos += 4;
+            } else {
+                break;
+            }
+            if (pos < 0 || pos > data.length) {
+                break;
+            }
+        }
+        return sb.toString();
+    }
+
     private static String buildOpenAiChatCompletionsStreamJson(String model, String prompt) {
         JSONObject req = new JSONObject();
         req.set("model", StrUtil.blankToDefault(model, "default"));
@@ -374,14 +688,36 @@ public class CursorChatOnlyIntercept extends HttpProxyIntercept {
 
     private static void cachePromptFromBidiAppend(io.netty.handler.codec.http.HttpHeaders headers, byte[] body) {
         try {
+            // #region agent log
+            dbg("pre", "H_TOOL_REQ", "cachePromptFromBidiAppend", "bidiappend_enter",
+                    "{\"hasHeaders\":" + (headers != null)
+                            + ",\"bodyLen\":" + (body == null ? 0 : body.length)
+                            + ",\"hasXRequestId\":" + (headers != null && headers.get("x-request-id") != null)
+                            + "}");
+            // #endregion
             String extracted = extractHumanTextFromConnectBody(body);
             if (extracted == null) {
+                // #region agent log
+                dbg("pre", "H_TOOL_REQ", "cachePromptFromBidiAppend", "bidiappend_no_human_text", "{}");
+                // #endregion
                 return;
             }
             extracted = extracted.trim();
             if (extracted.isEmpty()) {
                 return;
             }
+            int candScore = userTextCandidateScore(extracted);
+            // #region agent log
+            dbg("pre", "H_TOOL_REQ", "cachePromptFromBidiAppend", "bidiappend_human_text_candidate",
+                    "{\"preview\":\"" + esc(trimForLog(extracted)) + "\""
+                            + ",\"len\":" + extracted.length()
+                            + ",\"candScore\":" + candScore
+                            + ",\"rulesLike\":" + looksLikeRulesOrSkillDump(extracted)
+                            + ",\"containsToolWords\":" + (extracted.toLowerCase(Locale.ROOT).contains("tool")
+                            || extracted.toLowerCase(Locale.ROOT).contains("function")
+                            || extracted.toLowerCase(Locale.ROOT).contains("arguments"))
+                            + "}");
+            // #endregion
             if (looksLikeRulesOrSkillDump(extracted)) {
                 // #region agent log
                 dbg("pre", "H_CACHE", "cachePromptFromBidiAppend", "cache_skip_rules_like",
@@ -396,6 +732,34 @@ public class CursorChatOnlyIntercept extends HttpProxyIntercept {
             }
             String key = normalizeRequestIdKey(rid.trim());
             String prompt = sanitizePrompt(extracted);
+            // 过滤明显噪声：过短/得分过低的片段（常来自 BidiAppend 的非用户文本帧）
+            if (prompt.length() < 4 || candScore < 20) {
+                // #region agent log
+                dbg("pre", "H_CACHE", "cachePromptFromBidiAppend", "cache_skip_low_quality",
+                        "{\"key\":\"" + esc(key) + "\""
+                                + ",\"promptLen\":" + prompt.length()
+                                + ",\"candScore\":" + candScore
+                                + ",\"preview\":\"" + esc(trimForLog(prompt)) + "\"}");
+                // #endregion
+                return;
+            }
+
+            // 避免被后续低质量片段覆盖：只在得分更高时覆盖
+            String prev = REQUEST_PROMPT_CACHE.get(key);
+            if (prev != null && !prev.trim().isEmpty()) {
+                int prevScore = userTextCandidateScore(prev);
+                if (prevScore >= candScore) {
+                    // #region agent log
+                    dbg("pre", "H_CACHE", "cachePromptFromBidiAppend", "cache_keep_existing",
+                            "{\"key\":\"" + esc(key) + "\""
+                                    + ",\"prevScore\":" + prevScore
+                                    + ",\"candScore\":" + candScore
+                                    + ",\"prevPreview\":\"" + esc(trimForLog(prev)) + "\""
+                                    + ",\"candPreview\":\"" + esc(trimForLog(prompt)) + "\"}");
+                    // #endregion
+                    return;
+                }
+            }
             REQUEST_PROMPT_CACHE.put(key, prompt);
             // #region agent log
             dbg("pre", "H_CACHE", "cachePromptFromBidiAppend", "cache_put",
@@ -1138,6 +1502,127 @@ public class CursorChatOnlyIntercept extends HttpProxyIntercept {
         byte[] out = new byte[n];
         buf.getBytes(buf.readerIndex(), out);
         return out;
+    }
+
+    private static byte[] extractBytes(io.netty.handler.codec.http.HttpContent content) {
+        if (content == null || content.content() == null) {
+            return null;
+        }
+        ByteBuf b = content.content();
+        int n = b.readableBytes();
+        if (n <= 0) {
+            return null;
+        }
+        byte[] out = new byte[n];
+        b.getBytes(b.readerIndex(), out);
+        return out;
+    }
+
+    private static void parseAndLogConnectFrames(ByteArrayOutputStream buf, String runId) {
+        if (buf == null) {
+            return;
+        }
+        byte[] data = buf.toByteArray();
+        int pos = 0;
+        while (pos + 5 <= data.length) {
+            int typeByte = data[pos] & 0xFF;
+            int len = ((data[pos + 1] & 0xFF) << 24)
+                    | ((data[pos + 2] & 0xFF) << 16)
+                    | ((data[pos + 3] & 0xFF) << 8)
+                    | (data[pos + 4] & 0xFF);
+            if (len < 0 || len > 8 * 1024 * 1024) {
+                break;
+            }
+            if (pos + 5 + len > data.length) {
+                break;
+            }
+            byte[] wire = new byte[5 + len];
+            System.arraycopy(data, pos, wire, 0, wire.length);
+            pos += wire.length;
+
+            byte[] payload = com.github.monkeywie.proxyee.connect.ConnectProtoUtil.extractPayloadFromWire(wire);
+            String agentKind = payload == null ? "null" : com.github.monkeywie.proxyee.connect.ConnectProtoUtil.describeAgentServerMessageKind(payload);
+            String unifiedKind = payload == null ? "null" : com.github.monkeywie.proxyee.connect.ConnectProtoUtil.describeUnifiedChatResponseKind(payload);
+            String toolSummary = payload == null ? null : com.github.monkeywie.proxyee.connect.ConnectProtoUtil.extractUnifiedChatToolCallSummary(payload);
+            // #region agent log
+            dbg(runId, "H_DOWNSTREAM", "afterResponse(HttpContent)", "cursor_runsse_frame",
+                    "{\"typeByte\":" + typeByte
+                            + ",\"len\":" + len
+                            + ",\"agentKind\":\"" + esc(agentKind) + "\""
+                            + ",\"unifiedKind\":\"" + esc(unifiedKind) + "\""
+                            + ",\"toolSummary\":\"" + esc(toolSummary) + "\""
+                            + "}");
+            // #endregion
+
+            // #region agent log
+            // 仅在检测到 tool_call_v2 相关帧时，输出截断的 payload base64 供反推字段（不含鉴权信息）
+            if (toolSummary != null && toolSummary.contains("client_side_tool_v2_call") && payload != null) {
+                String b64 = java.util.Base64.getEncoder().encodeToString(payload);
+                if (b64.length() > 2048) {
+                    b64 = b64.substring(0, 2048) + "...";
+                }
+                String tagSummary = summarizeTopLevelProtobufTags(payload, 32);
+                String hexPrefix = hexPrefix(payload, 64);
+                byte[] inner1 = extractLengthDelimitedField(payload, 1, 128 * 1024);
+                String innerTagSummary = summarizeTopLevelProtobufTags(inner1, 32);
+                String innerHexPrefix = hexPrefix(inner1, 96);
+                String inner1LdFieldsMeta = inner1 == null ? "" : listTopLevelLengthDelimitedFieldsMeta(inner1, 6, 256);
+
+                // params 子消息：优先抓常见 field 8(read_file) / 23(run_terminal_command) / 54(ripgrep_raw) / 52(list_dir_v2) 等
+                int[] paramFields = new int[] {8, 23, 54, 52, 53, 55, 26, 69};
+                String paramsMeta = "";
+                if (inner1 != null && inner1.length > 0) {
+                    StringBuilder pm = new StringBuilder();
+                    for (int pf : paramFields) {
+                        byte[] pbytes = extractLengthDelimitedField(inner1, pf, 256 * 1024);
+                        if (pbytes == null || pbytes.length == 0) {
+                            continue;
+                        }
+                        String pTag = summarizeTopLevelProtobufTags(pbytes, 32);
+                        String pHex = hexPrefix(pbytes, 96);
+                        String pB64 = java.util.Base64.getEncoder().encodeToString(pbytes);
+                        if (pB64.length() > 2048) {
+                            pB64 = pB64.substring(0, 2048) + "...";
+                        }
+                        if (pm.length() > 0) {
+                            pm.append("|");
+                        }
+                        pm.append("f").append(pf)
+                                .append(":len=").append(pbytes.length)
+                                .append(",tags=").append(pTag)
+                                .append(",hex=").append(pHex)
+                                .append(",b64=").append(pB64);
+                    }
+                    paramsMeta = pm.toString();
+                }
+                dbg(runId, "H_DOWNSTREAM", "afterResponse(HttpContent)", "cursor_runsse_tool_payload_b64",
+                        "{\"agentKind\":\"" + esc(agentKind) + "\""
+                                + ",\"unifiedKind\":\"" + esc(unifiedKind) + "\""
+                                + ",\"toolSummary\":\"" + esc(toolSummary) + "\""
+                                + ",\"payloadLen\":" + payload.length
+                                + ",\"tagSummary\":\"" + esc(tagSummary) + "\""
+                                + ",\"hexPrefix\":\"" + esc(hexPrefix) + "\""
+                                + ",\"inner1Len\":" + (inner1 == null ? 0 : inner1.length)
+                                + ",\"inner1TagSummary\":\"" + esc(innerTagSummary) + "\""
+                                + ",\"inner1HexPrefix\":\"" + esc(innerHexPrefix) + "\""
+                                + ",\"inner1LdFieldsMeta\":\"" + esc(inner1LdFieldsMeta) + "\""
+                                + ",\"paramsMeta\":\"" + esc(paramsMeta) + "\""
+                                + ",\"payloadB64\":\"" + esc(b64) + "\""
+                                + "}");
+            }
+            // #endregion
+        }
+        if (pos > 0) {
+            ByteArrayOutputStream nb = new ByteArrayOutputStream(Math.max(0, data.length - pos) + 16);
+            if (pos < data.length) {
+                nb.write(data, pos, data.length - pos);
+            }
+            buf.reset();
+            try {
+                buf.write(nb.toByteArray());
+            } catch (IOException ignored) {
+            }
+        }
     }
 
     private static String normalizePath(String uri) {
